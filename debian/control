@@ -15,6 +15,7 @@ Build-Depends:
  python3-gssapi <!nocheck>,
  python3-libnacl <!nocheck>,
  python3-openssl <!nocheck>,
+ python3-typing-extensions <!nocheck>,
 # not packaged
 # python3-pkcs11 <!nocheck>,
  openssl,
