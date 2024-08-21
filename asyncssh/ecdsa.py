@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -54,7 +54,7 @@ class _ECKey(SSHKey):
 
     _key: Union[ECDSAPrivateKey, ECDSAPublicKey]
 
-    default_hash_name = 'sha256'
+    default_x509_hash = 'sha256'
     pem_name = b'EC'
     pkcs8_oid = ObjectIdentifier('1.2.840.10045.2.1')
 

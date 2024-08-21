@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2016-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -388,7 +388,7 @@ class SSHLineEditor:
 
         self._pos = new_pos
 
-    def _reset_line(self):
+    def _reset_line(self) -> None:
         """Reset input line to empty"""
 
         self._line = ''
@@ -398,7 +398,7 @@ class SSHLineEditor:
         self._start_column = self._cursor
         self._end_column = self._cursor
 
-    def _reset_pending(self):
+    def _reset_pending(self) -> None:
         """Reset a pending echoed line if any"""
 
         if self._line_pending:
@@ -704,8 +704,10 @@ class SSHLineEditor:
                     self._ring_bell()
 
             self._bell_rung = False
-            self._chan.write(''.join(self._outbuf))
-            self._outbuf.clear()
+
+            if self._outbuf:
+                self._chan.write(''.join(self._outbuf))
+                self._outbuf.clear()
         else:
             self._session.data_received(data, datatype)
 
@@ -745,7 +747,7 @@ class SSHLineEditorChannel:
        this class is wrapped around the channel, providing the caller with
        the ability to enable and disable input line editing and echoing.
 
-       .. note:: Line editing is only available when a psuedo-terminal
+       .. note:: Line editing is only available when a pseudo-terminal
                  is requested on the server channel and the character
                  encoding on the channel is not set to `None`.
 

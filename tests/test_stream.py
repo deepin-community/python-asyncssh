@@ -21,6 +21,7 @@
 """Unit tests for AsyncSSH stream API"""
 
 import asyncio
+import re
 
 import asyncssh
 
@@ -53,6 +54,18 @@ class _StreamServer(Server):
         elif action == 'custom_disconnect':
             await stdin.read(1)
             raise asyncssh.DisconnectError(99, 'Disconnect')
+        elif action == 'partial':
+            try:
+                await stdin.readexactly(10)
+            except asyncio.IncompleteReadError as exc:
+                stdout.write(exc.partial)
+
+            try:
+                await stdin.read()
+            except asyncssh.TerminalSizeChanged:
+                pass
+
+            stdout.write(await stdin.readexactly(5))
         else:
             stdin.channel.exit(255)
 
@@ -234,6 +247,19 @@ class _TestStream(ServerTestCase):
                 await stdout.readline()
 
     @asynctest
+    async def test_readexactly_partial_exception(self):
+        """Test readexactly returning partial data before an exception"""
+
+        async with self.connect() as conn:
+            stdin, stdout, _ = await conn.open_session('partial')
+
+            stdin.write('abcde')
+            stdout.channel.change_terminal_size(80, 24)
+            stdin.write('fghij')
+
+            self.assertEqual((await stdout.read()), 'abcdefghij')
+
+    @asynctest
     async def test_custom_disconnect(self):
         """Test receiving a custom disconnect message"""
 
@@ -365,6 +391,27 @@ class _TestStream(ServerTestCase):
                 await stdout.readuntil('')
 
             stdin.close()
+
+    @asynctest
+    async def test_readuntil_regex(self):
+        """Test readuntil with a regex pattern"""
+
+        async with self.connect() as conn:
+            stdin, stdout, _ = await conn.open_session()
+            stdin.write("hello world\nhello world")
+            output = await stdout.readuntil(
+                re.compile('hello world'), len('hello world')
+            )
+            self.assertEqual(output, "hello world")
+
+            output = await stdout.readuntil(
+                re.compile('hello world'), len('hello world')
+            )
+            self.assertEqual(output, "\nhello world")
+
+            stdin.close()
+
+        await conn.wait_closed()
 
     @asynctest
     async def test_abort(self):

@@ -30,7 +30,8 @@ import subprocess
 import asyncssh
 from asyncssh.misc import async_context_manager
 
-from .util import AsyncTestCase, all_tasks, current_task, run, x509_available
+from .util import AsyncTestCase, all_tasks, current_task, get_test_key
+from .util import run, x509_available
 
 
 class Server(asyncssh.SSHServer):
@@ -109,12 +110,12 @@ class ServerTestCase(AsyncTestCase):
 
         # pylint: disable=too-many-statements
 
-        ckey = asyncssh.generate_private_key('ssh-rsa')
+        ckey = get_test_key('ssh-rsa')
         ckey.write_private_key('ckey')
         ckey.write_private_key('ckey_encrypted', passphrase='passphrase')
         ckey.write_public_key('ckey.pub')
 
-        ckey_ecdsa = asyncssh.generate_private_key('ecdsa-sha2-nistp256')
+        ckey_ecdsa = get_test_key('ecdsa-sha2-nistp256')
         ckey_ecdsa.write_private_key('ckey_ecdsa')
         ckey_ecdsa.write_public_key('ckey_ecdsa.pub')
 
@@ -122,18 +123,21 @@ class ServerTestCase(AsyncTestCase):
                                                    principals=['ckey'])
         ckey_cert.write_certificate('ckey-cert.pub')
 
-        skey = asyncssh.generate_private_key('ssh-rsa')
+        skey = get_test_key('ssh-rsa', 1)
         skey.write_private_key('skey')
         skey.write_public_key('skey.pub')
 
-        skey_ecdsa = asyncssh.generate_private_key('ecdsa-sha2-nistp256')
+        skey_ecdsa = get_test_key('ecdsa-sha2-nistp256', 1)
         skey_ecdsa.write_private_key('skey_ecdsa')
         skey_ecdsa.write_public_key('skey_ecdsa.pub')
 
-        skey_cert = skey.generate_host_certificate(skey, 'name',
-                                                   principals=['127.0.0.1',
-                                                               'localhost'])
+        skey_cert = skey.generate_host_certificate(
+            skey, 'name', principals=['127.0.0.1', 'localhost'])
         skey_cert.write_certificate('skey-cert.pub')
+
+        skey_ecdsa_cert = skey_ecdsa.generate_host_certificate(
+            skey_ecdsa, 'name', principals=['127.0.0.1', 'localhost'])
+        skey_ecdsa_cert.write_certificate('skey_ecdsa-cert.pub')
 
         exp_cert = skey.generate_host_certificate(skey, 'name',
                                                   valid_after='-2d',
@@ -155,7 +159,7 @@ class ServerTestCase(AsyncTestCase):
             skey_x509_self.append_certificate('skey_x509_self', 'pem')
             skey_x509_self.write_certificate('skey_x509_self.pem', 'pem')
 
-            root_ca_key = asyncssh.generate_private_key('ssh-rsa')
+            root_ca_key = get_test_key('ssh-rsa', 2)
             root_ca_key.write_private_key('root_ca_key')
 
             root_ca_cert = root_ca_key.generate_x509_ca_certificate(
@@ -163,7 +167,7 @@ class ServerTestCase(AsyncTestCase):
             root_ca_cert.write_certificate('root_ca_cert.pem', 'pem')
             root_ca_cert.write_certificate('root_ca_cert.pub')
 
-            int_ca_key = asyncssh.generate_private_key('ssh-rsa')
+            int_ca_key = get_test_key('ssh-rsa', 3)
             int_ca_key.write_private_key('int_ca_key')
 
             int_ca_cert = root_ca_key.generate_x509_ca_certificate(
@@ -324,6 +328,22 @@ class ServerTestCase(AsyncTestCase):
         return await asyncssh.connect_reverse(self._server_addr,
                                               self._server_port,
                                               options=options, **kwargs)
+
+    @async_context_manager
+    async def run_client(self, sock, config=(), options=None, **kwargs):
+        """Run an SSH client on an already-connected socket"""
+
+        return await asyncssh.run_client(sock, config, options, **kwargs)
+
+    @async_context_manager
+    async def run_server(self, sock, config=(), options=None, **kwargs):
+        """Run an SSH server on an already-connected socket"""
+
+        options = asyncssh.SSHServerConnectionOptions(options,
+                                                      server_factory=Server,
+                                                      server_host_keys=['skey'])
+
+        return await asyncssh.run_server(sock, config, options, **kwargs)
 
     async def create_connection(self, client_factory, **kwargs):
         """Create a connection to the test server"""

@@ -1,3 +1,12 @@
+.. image:: https://readthedocs.org/projects/asyncssh/badge/?version=latest
+    :target: https://asyncssh.readthedocs.io/en/latest/?badge=latest
+    :alt: Documentation Status
+
+.. image:: https://img.shields.io/pypi/v/asyncssh.svg
+    :target: https://pypi.python.org/pypi/asyncssh/
+    :alt: AsyncSSH PyPI Project
+
+
 AsyncSSH: Asynchronous SSH for Python
 =====================================
 
@@ -32,6 +41,7 @@ Features
   * Environment variables, terminal type, and window size
   * Direct and forwarded TCP/IP channels
   * OpenSSH-compatible direct and forwarded UNIX domain socket channels
+  * OpenSSH-compatible TUN/TAP channels and packet forwarding
   * Local and remote TCP/IP port forwarding
   * Local and remote UNIX domain socket forwarding
   * Dynamic TCP/IP port forwarding via SOCKS
@@ -46,6 +56,10 @@ Features
 * Multiple SSH connections in a single event loop
 * Byte and string based I/O with settable encoding
 * A variety of `key exchange`__, `encryption`__, and `MAC`__ algorithms
+
+  * Including OpenSSH post-quantum kex algorithm
+    sntrup761x25519-sha512\@openssh.com
+
 * Support for `gzip compression`__
 
   * Including OpenSSH variant to delay compression until after auth
@@ -114,7 +128,7 @@ Prerequisites
 To use AsyncSSH 2.0 or later, you need the following:
 
 * Python 3.6 or later
-* cryptography (PyCA) 2.8 or later
+* cryptography (PyCA) 3.1 or later
 
 Installation
 ------------
@@ -142,6 +156,10 @@ functionality:
 
 * Install gssapi from https://pypi.python.org/pypi/gssapi if you
   want support for GSSAPI key exchange and authentication on UNIX.
+
+* Install liboqs from https://github.com/open-quantum-safe/liboqs
+  if you want support for the OpenSSH post-quantum key exchange
+  algorithm sntrup761x25519-sha512\@openssh.com.
 
 * Install libsodium from https://github.com/jedisct1/libsodium
   and libnacl from https://pypi.python.org/pypi/libnacl if you have
@@ -186,8 +204,8 @@ Windows, you can run:
 
 Note that you will still need to manually install the libsodium library
 listed above for libnacl to work correctly and/or libnettle for UMAC
-support. Unfortunately, since libsodium and libnettle are not Python
-packages, they cannot be directly installed using pip.
+support. Unfortunately, since liboqs, libsodium, and libnettle are not
+Python packages, they cannot be directly installed using pip.
 
 Installing the development branch
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

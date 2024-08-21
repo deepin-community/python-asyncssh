@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -23,7 +23,9 @@
 import functools
 import ipaddress
 import re
+import shlex
 import socket
+import sys
 
 from pathlib import Path, PurePath
 from random import SystemRandom
@@ -40,6 +42,16 @@ from .constants import DISC_KEY_EXCHANGE_FAILED, DISC_MAC_ERROR
 from .constants import DISC_NO_MORE_AUTH_METHODS_AVAILABLE
 from .constants import DISC_PROTOCOL_ERROR, DISC_PROTOCOL_VERSION_NOT_SUPPORTED
 from .constants import DISC_SERVICE_NOT_AVAILABLE
+
+if sys.platform != 'win32': # pragma: no branch
+    import fcntl
+    import struct
+    import termios
+
+TermModes = Mapping[int, int]
+TermModesArg = Optional[TermModes]
+TermSize = Tuple[int, int, int, int]
+TermSizeArg = Union[None, Tuple[int, int], TermSize]
 
 
 class _Hash(Protocol):
@@ -258,6 +270,18 @@ def parse_time_interval(value: str) -> float:
     return _parse_units(value, _time_units, 'time interval')
 
 
+def split_args(command: str) -> Sequence[str]:
+    """Split a command string into a list of arguments"""
+
+    lex = shlex.shlex(command, posix=True)
+    lex.whitespace_split = True
+
+    if sys.platform == 'win32': # pragma: no cover
+        lex.escape = []
+
+    return list(lex)
+
+
 _ACM = TypeVar('_ACM', bound=AsyncContextManager, covariant=True)
 
 class _ACMWrapper(Generic[_ACM]):
@@ -329,6 +353,14 @@ async def maybe_wait_closed(writer: '_SupportsWaitClosed') -> None:
         await writer.wait_closed()
     except AttributeError: # pragma: no cover
         pass
+
+
+def set_terminal_size(tty: IO, width: int, height: int,
+                      pixwidth: int, pixheight: int) -> None:
+    """Set the terminal size of a TTY"""
+
+    fcntl.ioctl(tty, termios.TIOCSWINSZ,
+                struct.pack('hhhh', height, width, pixwidth, pixheight))
 
 
 class Options:
@@ -763,6 +795,12 @@ class TerminalSizeChanged(Exception):
         self.height = height
         self.pixwidth = pixwidth
         self.pixheight = pixheight
+
+    @property
+    def term_size(self) -> TermSize:
+        """Return terminal size as a tuple of 4 integers"""
+
+        return self.width, self.height, self.pixwidth, self.pixheight
 
 
 _disc_error_map = {

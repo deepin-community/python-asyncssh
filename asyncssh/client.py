@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -216,7 +216,7 @@ class SSHClient:
         """Authentication was completed successfully
 
            This method is called when authentication has completed
-           succesfully. Applications may use this method to create
+           successfully. Applications may use this method to create
            whatever client sessions and direct TCP/IP or UNIX domain
            connections are needed and/or set up listeners for incoming
            TCP/IP or UNIX domain connections coming from the server.

@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -26,6 +26,7 @@ import socket
 from types import TracebackType
 from typing import TYPE_CHECKING, AnyStr, Callable, Generic, List, Optional
 from typing import Sequence, Tuple, Type, Union
+from typing_extensions import Self
 
 from .forward import SSHForwarderCoro
 from .forward import SSHLocalPortForwarder, SSHLocalPathForwarder
@@ -54,7 +55,7 @@ class SSHListener:
     def __init__(self) -> None:
         self._tunnel: Optional['SSHConnection'] = None
 
-    async def __aenter__(self) -> 'SSHListener':
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, _exc_type: Optional[Type[BaseException]],
@@ -183,6 +184,11 @@ class SSHTCPClientListener(SSHClientListener, Generic[AnyStr]):
                                     orig_host, orig_port)
 
         return chan, self._session_factory(orig_host, orig_port)
+
+    def get_addresses(self) -> List[Tuple]:
+        """Return the socket addresses being listened on"""
+
+        return [(self._listen_host, self._listen_port)]
 
     def get_port(self) -> int:
         """Return the port number being listened on"""

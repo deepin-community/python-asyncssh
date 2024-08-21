@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2022 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Dict, List, Sequence, Tuple, Type
 
 from .logging import SSHLogger
 from .misc import HashType
-from .packet import MPInt, SSHPacketHandler
+from .packet import SSHPacketHandler
 
 
 if TYPE_CHECKING:
@@ -74,14 +74,14 @@ class Kex(SSHPacketHandler):
 
         return self._logger
 
-    def compute_key(self, k: int, h: bytes, x: bytes,
+    def compute_key(self, k: bytes, h: bytes, x: bytes,
                     session_id: bytes, keylen: int) -> bytes:
         """Compute keys from output of key exchange"""
 
         key = b''
         while len(key) < keylen:
             hash_obj = self._hash_alg()
-            hash_obj.update(MPInt(k))
+            hash_obj.update(k)
             hash_obj.update(h)
             hash_obj.update(key if key else x + session_id)
             key += hash_obj.digest()

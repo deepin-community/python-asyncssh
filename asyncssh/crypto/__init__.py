@@ -24,6 +24,8 @@ from .cipher import BasicCipher, GCMCipher, register_cipher, get_cipher_params
 
 from .dsa import DSAPrivateKey, DSAPublicKey
 
+from .dh import DH
+
 from .ec import ECDSAPrivateKey, ECDSAPublicKey, ECDH
 
 from .ed import ed25519_available, ed448_available
@@ -37,6 +39,10 @@ from .kdf import pbkdf2_hmac
 from .misc import CryptoKey, PyCAKey
 
 from .rsa import RSAPrivateKey, RSAPublicKey
+
+from .sntrup import sntrup761_available
+from .sntrup import sntrup761_pubkey_bytes, sntrup761_ciphertext_bytes
+from .sntrup import sntrup761_keypair, sntrup761_encaps, sntrup761_decaps
 
 # Import chacha20-poly1305 cipher if available
 from .chacha import ChachaCipher, chacha_available

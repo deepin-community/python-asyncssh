@@ -1,4 +1,4 @@
-# Copyright (c) 2017-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2017-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -27,22 +27,22 @@ import asyncio
 import posixpath
 from pathlib import PurePath
 import shlex
-import stat
 import string
 import sys
 from types import TracebackType
-from typing import TYPE_CHECKING, List, NoReturn, Optional
+from typing import TYPE_CHECKING, AsyncIterator, List, NoReturn, Optional
 from typing import Sequence, Tuple, Type, Union, cast
-from typing_extensions import Protocol
+from typing_extensions import Protocol, Self
 
 from .constants import DEFAULT_LANG
+from .constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
 from .logging import SSHLogger
 from .misc import BytesOrStr, FilePath, HostPort, MaybeAwait
 from .misc import async_context_manager, plural
-from .sftp import SFTPAttrs, SFTPServer, SFTPServerFS, SFTPFileProtocol
-from .sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
-from .sftp import SFTPErrorHandler, SFTPProgressHandler
-from .sftp import SFTP_BLOCK_SIZE, local_fs, match_glob
+from .sftp import SFTPAttrs, SFTPGlob, SFTPName, SFTPServer, SFTPServerFS
+from .sftp import SFTPFileProtocol, SFTPError, SFTPFailure, SFTPBadMessage
+from .sftp import SFTPConnectionLost, SFTPErrorHandler, SFTPProgressHandler
+from .sftp import SFTP_BLOCK_SIZE, local_fs
 
 
 if TYPE_CHECKING:
@@ -76,8 +76,8 @@ class _SCPFSProtocol(Protocol):
     async def isdir(self, path: bytes) -> bool:
         """Return if the path refers to a directory"""
 
-    async def listdir(self, path: bytes) -> Sequence[bytes]:
-        """List the contents of a directory"""
+    def scandir(self, path: bytes) -> AsyncIterator[SFTPName]:
+        """Read the names and attributes of files in a directory"""
 
     async def mkdir(self, path: bytes) -> None:
         """Create a directory"""
@@ -240,7 +240,7 @@ class _SCPHandler:
 
         self._logger = reader.logger.get_child('sftp')
 
-    async def __aenter__(self) -> '_SCPHandler': # pragma: no cover
+    async def __aenter__(self) -> Self: # pragma: no cover
         """Allow _SCPHandler to be used as an async context manager"""
 
         return self
@@ -388,12 +388,14 @@ class _SCPHandler:
         elif self._error_handler:
             self._error_handler(exc)
 
-    async def close(self) -> None:
+    async def close(self, cancelled: bool = False) -> None:
         """Close an SCP session"""
 
         self.logger.info('Stopping remote SCP')
 
-        if self._server:
+        if cancelled:
+            self._writer.channel.abort()
+        elif self._server:
             cast('SSHServerChannel', self._writer.channel).exit(0)
         else:
             self._writer.close()
@@ -493,38 +495,39 @@ class _SCPSource(_SCPHandler):
         if final_exc:
             raise final_exc
 
-    async def _send_dir(self, srcpath: bytes,
-                        dstpath: bytes, attrs: SFTPAttrs) -> None:
+    async def _send_dir(self, srcpath: bytes, dstpath: bytes,
+                        attrs: SFTPAttrs) -> None:
         """Send directory over SCP"""
 
         self.logger.info('  Starting send of directory %s', srcpath)
 
         await self._make_cd_request(b'D', attrs, 0, srcpath)
 
-        for name in await self._fs.listdir(srcpath):
+        async for entry in self._fs.scandir(srcpath):
+            name = cast(bytes, entry.filename)
+
             if name in (b'.', b'..'):
                 continue
 
             await self._send_files(posixpath.join(srcpath, name),
-                                   posixpath.join(dstpath, name))
+                                   posixpath.join(dstpath, name),
+                                   entry.attrs)
 
         await self.make_request(b'E')
 
         self.logger.info('  Finished send of directory %s', srcpath)
 
-    async def _send_files(self, srcpath: bytes, dstpath: bytes) -> None:
+    async def _send_files(self, srcpath: bytes, dstpath: bytes,
+                          attrs: SFTPAttrs) -> None:
         """Send files via SCP"""
 
         try:
-            attrs = await self._fs.stat(srcpath)
-            assert attrs.permissions is not None
-
             if self._preserve:
                 await self._make_t_request(attrs)
 
-            if self._recurse and stat.S_ISDIR(attrs.permissions):
+            if self._recurse and attrs.type == FILEXFER_TYPE_DIRECTORY:
                 await self._send_dir(srcpath, dstpath, attrs)
-            elif stat.S_ISREG(attrs.permissions):
+            elif attrs.type == FILEXFER_TYPE_REGULAR:
                 await self._send_file(srcpath, dstpath, attrs)
             else:
                 raise _scp_error(SFTPFailure, 'Not a regular file', srcpath)
@@ -533,6 +536,8 @@ class _SCPSource(_SCPHandler):
 
     async def run(self, srcpath: _SCPPath) -> None:
         """Start SCP transfer"""
+
+        cancelled = False
 
         try:
             if isinstance(srcpath, PurePath):
@@ -546,12 +551,15 @@ class _SCPSource(_SCPHandler):
             if exc:
                 raise exc
 
-            for path in await match_glob(self._fs, srcpath):
-                await self._send_files(path, b'')
+            for name in await SFTPGlob(self._fs).match(srcpath):
+                await self._send_files(cast(bytes, name.filename),
+                                            b'', name.attrs)
+        except asyncio.CancelledError:
+            cancelled = True
         except (OSError, SFTPError) as exc:
             self.handle_error(exc)
         finally:
-            await self.close()
+            await self.close(cancelled)
 
 
 class _SCPSink(_SCPHandler):
@@ -697,6 +705,8 @@ class _SCPSink(_SCPHandler):
     async def run(self, dstpath: _SCPPath) -> None:
         """Start SCP file receive"""
 
+        cancelled = False
+
         try:
             if isinstance(dstpath, PurePath):
                 dstpath = str(dstpath)
@@ -709,10 +719,12 @@ class _SCPSink(_SCPHandler):
                                              dstpath))
             else:
                 await self._recv_files(b'', dstpath)
+        except asyncio.CancelledError as exc:
+            cancelled = True
         except (OSError, SFTPError, ValueError) as exc:
             self.handle_error(exc)
         finally:
-            await self.close()
+            await self.close(cancelled)
 
 
 class _SCPCopier:
@@ -868,13 +880,17 @@ class _SCPCopier:
     async def run(self) -> None:
         """Start SCP remote-to-remote transfer"""
 
+        cancelled = False
+
         try:
             await self._copy_files()
+        except asyncio.CancelledError:
+            cancelled = True
         except (OSError, SFTPError) as exc:
             self._handle_error(exc)
         finally:
-            await self._source.close()
-            await self._sink.close()
+            await self._source.close(cancelled)
+            await self._sink.close(cancelled)
 
 
 async def scp(srcpaths: Union[_SCPConnPath, Sequence[_SCPConnPath]],

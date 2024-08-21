@@ -1,4 +1,4 @@
-# Copyright (c) 2017-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2017-2022 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -20,7 +20,7 @@
 
 """GSSAPI wrapper for UNIX"""
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, SupportsBytes, cast
 
 from gssapi import Credentials, Name, NameType, OID
 from gssapi import RequirementFlag, SecurityContext
@@ -32,26 +32,27 @@ from .asn1 import OBJECT_IDENTIFIER
 def _mech_to_oid(mech: OID) -> bytes:
     """Return a DER-encoded OID corresponding to the requested GSS mechanism"""
 
-    mech_bytes = bytes(mech)
+    mech_bytes = bytes(cast(SupportsBytes, mech))
     return bytes((OBJECT_IDENTIFIER, len(mech_bytes))) + mech_bytes
 
 
 class GSSBase:
     """GSS base class"""
 
-    def __init__(self, host: str, usage: str):
+    def __init__(self, host: str):
         if '@' in host:
             self._host = Name(host)
         else:
             self._host = Name('host@' + host, NameType.hostbased_service)
 
-        if usage == 'initiate':
-            self._creds = Credentials(usage=usage)
-        else:
-            self._creds = Credentials(name=self._host, usage=usage)
-
         self._mechs = [_mech_to_oid(mech) for mech in self._creds.mechs]
         self._ctx: Optional[SecurityContext] = None
+
+    @property
+    def _creds(self) -> Credentials:
+        """Abstract method to construct GSS credentials"""
+
+        raise NotImplementedError
 
     def _init_context(self) -> None:
         """Abstract method to construct GSS security context"""
@@ -76,8 +77,8 @@ class GSSBase:
 
         assert self._ctx is not None
 
-        return (RequirementFlag.mutual_authentication in
-                self._ctx.actual_flags)
+        return bool(self._ctx.actual_flags &
+                    RequirementFlag.mutual_authentication)
 
     @property
     def provides_integrity(self) -> bool:
@@ -85,7 +86,7 @@ class GSSBase:
 
         assert self._ctx is not None
 
-        return RequirementFlag.integrity in self._ctx.actual_flags
+        return bool(self._ctx.actual_flags & RequirementFlag.integrity)
 
     @property
     def user(self) -> str:
@@ -141,15 +142,21 @@ class GSSClient(GSSBase):
     """GSS client"""
 
     def __init__(self, host: str, delegate_creds: bool):
-        super().__init__(host, 'initiate')
+        super().__init__(host)
 
-        flags = set((RequirementFlag.mutual_authentication,
-                     RequirementFlag.integrity))
+        flags = RequirementFlag.mutual_authentication | \
+                RequirementFlag.integrity
 
         if delegate_creds:
-            flags.add(RequirementFlag.delegate_to_peer)
+            flags |= RequirementFlag.delegate_to_peer
 
         self._flags = flags
+
+    @property
+    def _creds(self) -> Credentials:
+        """Abstract method to construct GSS credentials"""
+
+        return Credentials(usage='initiate')
 
     def _init_context(self) -> None:
         """Construct GSS client security context"""
@@ -161,8 +168,11 @@ class GSSClient(GSSBase):
 class GSSServer(GSSBase):
     """GSS server"""
 
-    def __init__(self, host: str):
-        super().__init__(host, 'accept')
+    @property
+    def _creds(self) -> Credentials:
+        """Abstract method to construct GSS credentials"""
+
+        return Credentials(name=self._host, usage='accept')
 
     def _init_context(self) -> None:
         """Construct GSS server security context"""

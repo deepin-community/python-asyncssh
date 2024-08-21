@@ -1,0 +1,50 @@
+From: Colin Watson <cjwatson@debian.org>
+Date: Sun, 18 Aug 2024 11:34:04 +0100
+Subject: Deduplicate results from getaddrinfo
+
+In certain configurations it's possible to get duplicate results back
+from `getaddrinfo`: for example, if you accidentally have more than one
+line in `/etc/hosts` mapping the same name to the same IP address, then
+Linux/glibc systems will return multiple identical entries.  This minor
+misconfiguration is normally harmless, but it caused
+`create_tcp_local_listener` to fail due to trying to bind the same
+address multiple times, which in turn caused the X11 tests to fail in a
+confusing way.  It's easy enough to deduplicate these.
+
+Bug-Debian: https://bugs.debian.org/1052788
+Forwarded: https://github.com/ronf/asyncssh/pull/679
+Last-Update: 2024-08-18
+---
+ asyncssh/listener.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/asyncssh/listener.py b/asyncssh/listener.py
+index 7c25508..baeae92 100644
+--- a/asyncssh/listener.py
++++ b/asyncssh/listener.py
+@@ -25,7 +25,7 @@ import errno
+ import socket
+ from types import TracebackType
+ from typing import TYPE_CHECKING, AnyStr, Callable, Generic, List, Optional
+-from typing import Sequence, Tuple, Type, Union
++from typing import Sequence, Set, Tuple, Type, Union
+ from typing_extensions import Self
+ 
+ from .forward import SSHForwarderCoro
+@@ -285,9 +285,15 @@ async def create_tcp_local_listener(
+     if not addrinfo: # pragma: no cover
+         raise OSError('getaddrinfo() returned empty list')
+ 
++    seen_addrinfo: Set[Tuple] = set()
+     servers: List[asyncio.AbstractServer] = []
+ 
+-    for family, socktype, proto, _, sa in addrinfo:
++    for addrinfo_entry in addrinfo:
++        family, socktype, proto, _, sa = addrinfo_entry
++        if addrinfo_entry in seen_addrinfo: # pragma: no cover
++            continue
++        seen_addrinfo.add(addrinfo_entry)
++
+         try:
+             sock = socket.socket(family, socktype, proto)
+         except OSError: # pragma: no cover

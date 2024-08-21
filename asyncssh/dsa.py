@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -41,7 +41,7 @@ class _DSAKey(SSHKey):
     _key: Union[DSAPrivateKey, DSAPublicKey]
 
     algorithm = b'ssh-dss'
-    default_hash_name = 'sha1'
+    default_x509_hash = 'sha256'
     pem_name = b'DSA'
     pkcs8_oid = ObjectIdentifier('1.2.840.10040.4.1')
     sig_algorithms = (algorithm,)
@@ -123,7 +123,7 @@ class _DSAKey(SSHKey):
         if (isinstance(alg_params, tuple) and len(alg_params) == 3 and
                 all_ints(alg_params) and isinstance(x, int)):
             p, q, g = alg_params
-            y = pow(g, x, p)
+            y: int = pow(g, x, p)
             return p, q, g, y, x
         else:
             return None

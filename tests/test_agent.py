@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2020 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2016-2022 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -36,7 +36,7 @@ from asyncssh.crypto import ed25519_available
 from asyncssh.packet import Byte, String, UInt32
 
 from .sk_stub import sk_available, patch_sk
-from .util import AsyncTestCase, asynctest, run
+from .util import AsyncTestCase, asynctest, get_test_key, run, try_remove
 
 
 def agent_test(func):
@@ -85,7 +85,7 @@ class _Agent:
         self._server.close()
         await self._server.wait_closed()
 
-        os.remove(self._path)
+        try_remove(self._path)
 
 
 class _TestAgent(AsyncTestCase):
@@ -173,13 +173,13 @@ class _TestAgent(AsyncTestCase):
     async def test_sign(self, agent):
         """Test signing a block of data using the agent"""
 
-        algs = ['ssh-dss', 'ssh-rsa', 'ecdsa-sha2-nistp256']
+        algs = ['ssh-rsa', 'ecdsa-sha2-nistp256']
 
         if ed25519_available: # pragma: no branch
             algs.append('ssh-ed25519')
 
         for alg_name in algs:
-            key = asyncssh.generate_private_key(alg_name)
+            key = get_test_key(alg_name)
             pubkey = key.convert_to_public()
             cert = key.generate_user_certificate(key, 'name')
 
@@ -187,6 +187,7 @@ class _TestAgent(AsyncTestCase):
             agent_keys = await agent.get_keys()
 
             for agent_key in agent_keys:
+                agent_key.set_sig_algorithm(agent_key.sig_algorithms[0])
                 sig = await agent_key.sign_async(b'test')
                 self.assertTrue(pubkey.verify(b'test', sig))
 
@@ -196,10 +197,10 @@ class _TestAgent(AsyncTestCase):
     async def test_set_certificate(self, agent):
         """Test setting certificate on an existing keypair"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ssh-rsa')
         cert = key.generate_user_certificate(key, 'name')
 
-        key2 = asyncssh.generate_private_key('ssh-rsa')
+        key2 = get_test_key('ssh-rsa', 1)
         cert2 = key.generate_user_certificate(key2, 'name')
 
         await agent.add_keys([key])
@@ -222,7 +223,7 @@ class _TestAgent(AsyncTestCase):
     async def test_reconnect(self, agent):
         """Test reconnecting to the agent after closing it"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ecdsa-sha2-nistp256')
         pubkey = key.convert_to_public()
 
         async with agent:
@@ -241,7 +242,7 @@ class _TestAgent(AsyncTestCase):
         agent_keys = await agent.get_keys()
         self.assertEqual(len(agent_keys), 0)
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ssh-rsa')
         await agent.add_keys([key])
         agent_keys = await agent.get_keys()
         self.assertEqual(len(agent_keys), 1)
@@ -270,7 +271,7 @@ class _TestAgent(AsyncTestCase):
     async def test_add_nonlocal(self, agent):
         """Test failure when adding a non-local key to an agent"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ssh-rsa')
 
         async with agent:
             await agent.add_keys([key])
@@ -284,7 +285,7 @@ class _TestAgent(AsyncTestCase):
         """Test failure adding keys to the agent"""
 
         os.mkdir('.ssh', 0o700)
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ssh-rsa')
         key.write_private_key(Path('.ssh', 'id_rsa'))
 
         try:
@@ -309,8 +310,7 @@ class _TestAgent(AsyncTestCase):
     async def test_add_sk_keys(self):
         """Test adding U2F security keys"""
 
-        key = asyncssh.generate_private_key(
-            'sk-ecdsa-sha2-nistp256@openssh.com')
+        key = get_test_key('sk-ecdsa-sha2-nistp256@openssh.com')
         cert = key.generate_user_certificate(key, 'test')
 
         mock_agent = _Agent(Byte(SSH_AGENT_SUCCESS))
@@ -333,8 +333,7 @@ class _TestAgent(AsyncTestCase):
     async def test_get_sk_keys(self):
         """Test getting U2F security keys"""
 
-        key = asyncssh.generate_private_key(
-            'sk-ecdsa-sha2-nistp256@openssh.com')
+        key = get_test_key('sk-ecdsa-sha2-nistp256@openssh.com')
         cert = key.generate_user_certificate(key, 'test')
 
         mock_agent = _Agent(Byte(SSH_AGENT_IDENTITIES_ANSWER) + UInt32(2) +
@@ -374,7 +373,7 @@ class _TestAgent(AsyncTestCase):
     async def test_confirm(self, agent):
         """Test confirmation of key"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ecdsa-sha2-nistp256')
         pubkey = key.convert_to_public()
 
         await agent.add_keys([key], confirm=True)
@@ -396,7 +395,7 @@ class _TestAgent(AsyncTestCase):
     async def test_lock(self, agent):
         """Test lock and unlock"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ecdsa-sha2-nistp256')
         pubkey = key.convert_to_public()
 
         await agent.add_keys([key])
@@ -458,7 +457,7 @@ class _TestAgent(AsyncTestCase):
     async def test_unknown_key(self, agent):
         """Test failure when signing with an unknown key"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ssh-rsa')
 
         with self.assertRaises(ValueError):
             await agent.sign(key.public_data, b'test')
@@ -474,7 +473,7 @@ class _TestAgent(AsyncTestCase):
     async def test_errors(self):
         """Test getting error responses from SSH agent"""
 
-        key = asyncssh.generate_private_key('ssh-rsa')
+        key = get_test_key('ssh-rsa')
         keypair = asyncssh.load_keypairs(key)[0]
 
         for response in (None, b'', Byte(SSH_AGENT_FAILURE), b'\xff'):

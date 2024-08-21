@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2020-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -279,11 +279,21 @@ class _TestClientConfig(_TestConfig):
                                     'UserKnownHostsFile file2')
         self.assertEqual(config.get('UserKnownHostsFile'), ['file1'])
 
+        config = self._parse_config('UserKnownHostsFile none\n'
+                                    'UserKnownHostsFile file2')
+        self.assertEqual(config.get('UserKnownHostsFile'), [])
+
     def test_append_string_list(self):
         """Test appending multiple string config options to a list"""
 
-        config = self._parse_config('SendEnv foo\nSendEnv  bar baz')
+        config = self._parse_config('SendEnv foo\nSendEnv bar baz')
         self.assertEqual(config.get('SendEnv'), ['foo', 'bar', 'baz'])
+
+    def test_set_environment(self):
+        """Test setting environment with equals-separated key/value pairs"""
+
+        config = self._parse_config('SetEnv A=1 B= C=D=2\nSetEnv E=3')
+        self.assertEqual(config.get('SetEnv'), ['A=1', 'B=', 'C=D=2'])
 
     def test_set_remote_command(self):
         """Test setting a remote command"""
@@ -343,6 +353,17 @@ class _TestClientConfig(_TestConfig):
 
         self.assertEqual(config.get('User'), 'newuser')
         self.assertEqual(config.get('BindAddress'), 'addr')
+        self.assertEqual(config.get('Port'), 2222)
+
+    def test_tag(self):
+        """Test setting and matching a tag"""
+
+        config = self._parse_config('Tag tag2\n'
+                                    'Match tagged tag1\n'
+                                    '  Port 1111\n'
+                                    'Match tagged tag*\n'
+                                    '  Port 2222')
+
         self.assertEqual(config.get('Port'), 2222)
 
     def test_port_already_set(self):
@@ -417,8 +438,14 @@ class _TestClientConfig(_TestConfig):
 
             return path
 
+        def mock_pathlib_expanduser(self):
+            """Expand user even with os.path.expanduser mocked out"""
+
+            return Path(os.environ['HOME'], *self.parts[1:])
+
         with self.assertRaises(asyncssh.ConfigParseError):
-            with patch('os.path.expanduser', mock_expanduser):
+            with patch('os.path.expanduser', mock_expanduser), \
+                    patch('pathlib.Path.expanduser', mock_pathlib_expanduser):
                 self._parse_config('RemoteCommand %d')
 
     def test_uid_percent_expansion_unavailable(self):

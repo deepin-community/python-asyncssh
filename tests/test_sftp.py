@@ -1,4 +1,4 @@
-# Copyright (c) 2015-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2015-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -20,6 +20,7 @@
 
 """Unit tests for AsyncSSH SFTP client and server"""
 
+import asyncio
 import errno
 import functools
 import os
@@ -252,7 +253,7 @@ class _ReorderReadServerHandler(SFTPServerHandler):
 class _CheckPropSFTPServer(SFTPServer):
     """Return an FTP server which checks channel properties"""
 
-    def listdir(self, path):
+    def listdir(self, _path):
         """List the contents of a directory"""
 
         if self.channel.get_connection() == self.connection: # pragma: no branch
@@ -349,7 +350,7 @@ class _FileTypeSFTPServer(SFTPServer):
                    (FILEXFER_TYPE_BLOCK_DEVICE, stat.S_IFBLK),
                    (FILEXFER_TYPE_FIFO,         stat.S_IFIFO))
 
-    def listdir(self, path):
+    def listdir(self, _path):
         """List the contents of a directory"""
 
         return [SFTPName(str(filetype).encode('ascii'),
@@ -360,8 +361,10 @@ class _FileTypeSFTPServer(SFTPServer):
 class _LongnameSFTPServer(SFTPServer):
     """Return a fixed set of files in response to a listdir request"""
 
-    def listdir(self, path):
+    def listdir(self, _path):
         """List the contents of a directory"""
+
+        # pylint: disable=no-self-use
 
         return list((b'.',
                      b'..',
@@ -416,7 +419,7 @@ class _ChownSFTPServer(SFTPServer):
     _ownership = {}
 
     def setstat(self, path, attrs):
-        """Set attributes of a file or directory"""
+        """Get attributes of a file or directory, following symlinks"""
 
         self._ownership[self.map_path(path)] = \
             (attrs.uid, attrs.gid, attrs.owner, attrs.group)
@@ -458,10 +461,21 @@ class _SFTPAttrsSFTPServer(SFTPServer):
             else:
                 raise SFTPError(99, exc.strerror) from None
 
+    async def lstat(self, path):
+        """Get attributes of a local file, directory, or symlink"""
+
+        return SFTPAttrs.from_local(super().lstat(path))
+
     async def fstat(self, file_obj):
         """Get attributes of an open file"""
 
         return SFTPAttrs.from_local(super().fstat(file_obj))
+
+    async def scandir(self, path):
+        """Return names and attributes of the files in a local directory"""
+
+        async for name in super().scandir(path):
+            yield name
 
 
 class _AsyncSFTPServer(SFTPServer):
@@ -505,19 +519,24 @@ class _AsyncSFTPServer(SFTPServer):
         return super().fstat(file_obj)
 
     async def setstat(self, path, attrs):
-        """Set attributes of a file or directory"""
+        """Set attributes of a file or directory, following symlinks"""
 
         super().setstat(path, attrs)
+
+    async def lsetstat(self, path, attrs):
+        """Set attributes of a file, directory, or symlink"""
+
+        super().lsetstat(path, attrs)
 
     async def fsetstat(self, file_obj, attrs):
         """Set attributes of an open file"""
 
         super().fsetstat(file_obj, attrs)
 
-    async def listdir(self, path):
-        """List the contents of a directory"""
+    def scandir(self, path):
+        """Scan the contents of a directory"""
 
-        return super().listdir(path)
+        return super().scandir(path)
 
     async def remove(self, path):
         """Remove a file or symbolic link"""
@@ -766,6 +785,43 @@ class _TestSFTP(_CheckSFTP):
                 finally:
                     remove('src dst')
 
+    @unittest.skipIf(sys.platform == 'win32', 'skip lsetstat tests on Windows')
+    @sftp_test
+    async def test_copy_preserve_link(self, sftp):
+        """Test copying a symlink with preserved attributes over SFTP"""
+
+        for method in ('get', 'put', 'copy'):
+            with self.subTest(method=method):
+                try:
+                    os.symlink('file', 'link1')
+                    os.utime('link1', times=(1, 2), follow_symlinks=False)
+                    await getattr(sftp, method)(
+                        'link1', 'link2', preserve=True, follow_symlinks=False)
+                    self.assertEqual(os.lstat('link2').st_mtime, 2)
+                finally:
+                    remove('link1 link2')
+
+    @unittest.skipIf(sys.platform == 'win32', 'skip lsetstat tests on Windows')
+    def test_copy_preserve_link_unsupported(self):
+        """Test preserving symlink attributes over SFTP without lsetstat"""
+
+        @sftp_test
+        async def _lsetstat_unsupported(self, sftp):
+            """Try copying link attributes without lsetstat"""
+
+            try:
+                os.symlink('file', 'link1')
+                os.utime('link1', times=(1, 2), follow_symlinks=False)
+                await sftp.put('link1', 'link2', preserve=True,
+                               follow_symlinks=False)
+                self.assertNotEqual(int(os.lstat('link2').st_mtime), 2)
+            finally:
+                remove('link1 link2')
+
+        with patch('asyncssh.sftp.SFTPServerHandler._extensions', []):
+            # pylint: disable=no-value-for-parameter
+            _lsetstat_unsupported(self)
+
     @sftp_test
     async def test_copy_recurse(self, sftp):
         """Test recursively copying a directory over SFTP"""
@@ -831,12 +887,31 @@ class _TestSFTP(_CheckSFTP):
                     remove('src dst link')
 
     @sftp_test
+    async def test_copy_recurse_follow_symlinks(self, sftp):
+        """Test recursively copying over SFTP while following symlinks"""
+
+        if not self._symlink_supported: # pragma: no cover
+            raise unittest.SkipTest('symlink not available')
+
+        for method in ('get', 'put', 'copy'):
+            with self.subTest(method=method):
+                try:
+                    os.mkdir('src')
+                    self._create_file('src/file1')
+                    os.symlink('file1', 'src/file2')
+                    await getattr(sftp, method)('src', 'dst', recurse=True,
+                                                follow_symlinks=True)
+                    self._check_file('src/file1', 'dst/file2')
+                finally:
+                    remove('src dst')
+
+    @sftp_test
     async def test_copy_invalid_name(self, sftp):
         """Test copying a file with an invalid name over SFTP"""
 
         for method in ('get', 'put', 'copy', 'mget', 'mput', 'mcopy'):
             with self.subTest(method=method):
-                with self.assertRaises((FileNotFoundError, SFTPNoSuchFile,
+                with self.assertRaises((OSError, SFTPNoSuchFile,
                                         SFTPFailure, UnicodeDecodeError)):
                     await getattr(sftp, method)(b'\xff')
 
@@ -1066,7 +1141,11 @@ class _TestSFTP(_CheckSFTP):
             (['file*/*2'],               ['filedir/file2', 'filedir/filedir2']),
             (['file*/*[3-9]'],           ['filedir/file3']),
             (['**/file[12]'],            ['file1', 'filedir/file2']),
-            (['**/file*/'],              ['filedir', 'filedir/filedir2']),
+            (['**/file*/'],              ['filedir/', 'filedir/filedir2/']),
+            (['filedir/**'],             ['filedir', 'filedir/file2',
+                                          'filedir/file3', 'filedir/filedir2',
+                                          'filedir/filedir2/file4',
+                                          'filedir/filedir2/file5']),
             ('filedir/file2',            ['filedir/file2']),
             ('./filedir/file2',          ['./filedir/file2']),
             ('filedir/file*',            ['filedir/file2', 'filedir/file3',
@@ -1087,7 +1166,8 @@ class _TestSFTP(_CheckSFTP):
             ('filedir/filedir*/file*',   ['filedir/filedir2/file4',
                                           'filedir/filedir2/file5']),
             ('./**/filedir2/file4',      ['./filedir/filedir2/file4']),
-            ('**/filedir2/file4',        ['filedir/filedir2/file4']))
+            ('**/filedir2/file4',        ['filedir/filedir2/file4']),
+            (['file1', '**/file1'],      ['file1']))
 
         try:
             os.mkdir('filedir')
@@ -1109,11 +1189,28 @@ class _TestSFTP(_CheckSFTP):
             remove('file1 filedir')
 
     @sftp_test
-    async def test_glob_error(self, sftp):
-        """Test a glob pattern match error over SFTP"""
+    async def test_glob_errors(self, sftp):
+        """Test glob pattern match errors over SFTP"""
 
-        with self.assertRaises(SFTPNoSuchFile):
-            await sftp.glob('file*')
+        _glob_errors = (
+            'file*',
+            'dir/file1/*',
+            'dir*/file1/*',
+            'dir/dir1/*')
+
+        try:
+            os.mkdir('dir')
+            self._create_file('dir/file1')
+            os.mkdir('dir/dir1')
+            os.chmod('dir/dir1', 0)
+
+            for pattern in _glob_errors:
+                with self.subTest(pattern=pattern):
+                    with self.assertRaises(SFTPNoSuchFile):
+                        await sftp.glob(pattern)
+        finally:
+            os.chmod('dir/dir1', 0o700)
+            remove('dir')
 
     @sftp_test_v4
     async def test_glob_error_v4(self, sftp):
@@ -1217,6 +1314,33 @@ class _TestSFTP(_CheckSFTP):
         finally:
             remove('link')
 
+    @sftp_test_v6
+    async def test_lstat_v6(self, sftp):
+        """Test getting attributes on a link with SFTPv6"""
+
+        if not self._symlink_supported: # pragma: no cover
+            raise unittest.SkipTest('symlink not available')
+
+        try:
+            os.symlink('file', 'link')
+            self._check_stat_v4((await sftp.lstat('link')), os.lstat('link'))
+        finally:
+            remove('link')
+
+    @sftp_test
+    async def test_lstat_via_stat(self, sftp):
+        """Test getting attributes on a link by disabling follow_symlinks"""
+
+        if not self._symlink_supported: # pragma: no cover
+            raise unittest.SkipTest('symlink not available')
+
+        try:
+            os.symlink('file', 'link')
+            self._check_stat((await sftp.stat('link', follow_symlinks=False)),
+                             os.lstat('link'))
+        finally:
+            remove('link')
+
     @sftp_test
     async def test_setstat(self, sftp):
         """Test setting attributes on a file"""
@@ -1270,6 +1394,63 @@ class _TestSFTP(_CheckSFTP):
                                                          group='yyy'))
         finally:
             remove('file')
+
+    @unittest.skipIf(sys.platform == 'win32', 'skip lsetstat tests on Windows')
+    @sftp_test
+    async def test_lsetstat(self, sftp):
+        """Test setting attributes on a link"""
+
+        try:
+            os.symlink('file', 'link')
+
+            await sftp.setstat('link', SFTPAttrs(atime=1, mtime=2),
+                               follow_symlinks=False)
+
+            stat_result = os.lstat('link')
+            self.assertEqual(stat_result.st_atime, 1)
+            self.assertEqual(stat_result.st_mtime, 2)
+        finally:
+            remove('link')
+
+    @unittest.skipIf(sys.platform == 'win32', 'skip lsetstat tests on Windows')
+    @sftp_test_v4
+    async def test_lsetstat_v4(self, sftp):
+        """Test setting attributes on a link"""
+
+        try:
+            os.symlink('file', 'link')
+
+            await sftp.setstat('link', SFTPAttrs(atime=1),
+                               follow_symlinks=False)
+
+            self.assertEqual(os.lstat('link').st_atime, 1)
+
+            await sftp.setstat('link', SFTPAttrs(mtime=2),
+                               follow_symlinks=False)
+
+            self.assertEqual(os.lstat('link').st_mtime, 2)
+        finally:
+            remove('link')
+
+    @unittest.skipIf(sys.platform == 'win32', 'skip lsetstat tests on Windows')
+    @sftp_test_v6
+    async def test_lsetstat_v6(self, sftp):
+        """Test setting attributes on a link"""
+
+        try:
+            os.symlink('file', 'link')
+
+            await sftp.setstat('link', SFTPAttrs(atime=1),
+                               follow_symlinks=False)
+
+            self.assertEqual(os.lstat('link').st_atime, 1)
+
+            await sftp.setstat('link', SFTPAttrs(mtime=2),
+                               follow_symlinks=False)
+
+            self.assertEqual(os.lstat('link').st_mtime, 2)
+        finally:
+            remove('link')
 
     @unittest.skipIf(sys.platform == 'win32', 'skip statvfs tests on Windows')
     @sftp_test
@@ -1965,6 +2146,10 @@ class _TestSFTP(_CheckSFTP):
 
             f = await sftp.open('file', 'rb')
             self.assertEqual((await f.read()), b'xxx')
+
+            await f.seek(0)
+            self.assertEqual([result async for result in
+                              await f.read_parallel()], [(0, b'xxx')])
         finally:
             if f: # pragma: no branch
                 await f.close()
@@ -1982,6 +2167,8 @@ class _TestSFTP(_CheckSFTP):
 
             f = await sftp.open('file')
             self.assertEqual((await f.read(4, 2)), 'xxyy')
+            self.assertEqual([result async for result in
+                              await f.read_parallel(4, 2)], [(2, b'xxyy')])
         finally:
             if f: # pragma: no branch
                 await f.close()
@@ -2032,10 +2219,11 @@ class _TestSFTP(_CheckSFTP):
             f = None
 
             try:
-                self._create_file('file', 4*1024*1024*'\0')
+                random_data = os.urandom(4*1024*1024)
+                self._create_file('file', random_data)
 
-                async with sftp.open('file') as f:
-                    await f.read()
+                async with sftp.open('file', 'rb') as f:
+                    self.assertEqual(await f.read(), random_data)
             finally:
                 remove('file')
 
@@ -2228,6 +2416,8 @@ class _TestSFTP(_CheckSFTP):
             f = await sftp.open('file', 'a+')
             await f.write('yyy')
             self.assertEqual((await f.read()), '')
+            self.assertEqual([result async for result in
+                              await f.read_parallel()], [])
             await f.close()
 
             with open('file') as localf:
@@ -3022,6 +3212,9 @@ class _TestSFTP(_CheckSFTP):
                 await f.read()
 
             with self.assertRaises(ValueError):
+                await f.read_parallel()
+
+            with self.assertRaises(ValueError):
                 await f.write('')
 
             with self.assertRaises(ValueError):
@@ -3469,6 +3662,10 @@ class _TestSFTP(_CheckSFTP):
 
                 with self.assertRaises(SFTPOpUnsupported):
                     await f.fsync()
+
+                with self.assertRaises(SFTPOpUnsupported):
+                    await sftp.setstat('file1', SFTPAttrs(),
+                                       follow_symlinks=False)
             finally:
                 if f: # pragma: no branch
                     await f.close()
@@ -3758,6 +3955,35 @@ class _TestSFTP(_CheckSFTP):
                 await sftp.statvfs('.')
 
         asyncssh.set_sftp_log_level('WARNING')
+
+    @sftp_test
+    async def test_makedirs_no_parent_perms(self, sftp):
+        """Test creating a directory path without perms for a parent dir"""
+
+        orig_mkdir = sftp.mkdir
+
+        def _mkdir(path, *args, **kwargs):
+            if path == b'/':
+                raise SFTPPermissionDenied('')
+            return orig_mkdir(path, *args, **kwargs)
+
+        try:
+            root = os.path.abspath(os.getcwd())
+            with patch.object(sftp, 'mkdir', _mkdir):
+                await sftp.makedirs(os.path.join(root, 'dir/dir1'))
+                self.assertTrue(os.path.isdir(os.path.join(root, 'dir/dir1')))
+        finally:
+            remove('dir')
+
+    @sftp_test
+    async def test_makedirs_no_perms(self, sftp):
+        """Test creating a directory path without perms for all parents"""
+
+        root = os.path.abspath(os.getcwd())
+
+        with patch.object(sftp, 'mkdir', side_effect=SFTPPermissionDenied('')):
+            with self.assertRaises(SFTPPermissionDenied):
+                await sftp.makedirs(os.path.join(root, 'dir/dir1'))
 
 
 class _TestSFTPCallable(_CheckSFTP):
@@ -4072,9 +4298,13 @@ class _TestSFTPIOError(_CheckSFTP):
         try:
             self._create_file('file', 4*1024*1024*'\0')
 
-            with self.assertRaises(SFTPFailure):
-                async with sftp.open('file') as f:
+            async with sftp.open('file') as f:
+                with self.assertRaises(SFTPFailure):
                     await f.read(4*1024*1024)
+
+                with self.assertRaises(SFTPFailure):
+                    async for _ in  await f.read_parallel(4*1024*1024):
+                        pass
         finally:
             remove('file')
 
@@ -4548,6 +4778,24 @@ class _CheckSCP(_CheckSFTP):
                 self.assertEqual(len(reports), (size // 8192) + 1)
                 self.assertEqual(reports[-1], size)
 
+    async def _check_cancel(self, src, dst):
+        """Check cancelling a file transfer over SCP"""
+
+        def _cancel(_srcpath, _dstpath, _bytes_copied, _total_bytes):
+            """Cancel transfer"""
+
+            task.cancel()
+
+        try:
+            self._create_file('src', 1024*8192 * 'a')
+
+            coro = scp(src, dst, block_size=8192, progress_handler=_cancel)
+
+            task = asyncio.create_task(coro)
+            await task
+        finally:
+            remove('src dst')
+
 
 class _TestSCP(_CheckSCP):
     """Unit tests for AsyncSSH SCP client and server"""
@@ -4566,6 +4814,12 @@ class _TestSCP(_CheckSCP):
         """Test getting a file over SCP with progress reporting"""
 
         await self._check_progress((self._scp_server, 'src'), 'dst')
+
+    @asynctest
+    async def test_get_cancel(self):
+        """Test cancelling a get of a file over SCP"""
+
+        await self._check_cancel((self._scp_server, 'src'), 'dst')
 
     @asynctest
     async def test_get_preserve(self):
@@ -4695,6 +4949,12 @@ class _TestSCP(_CheckSCP):
         """Test putting a file over SCP with progress reporting"""
 
         await self._check_progress('src', (self._scp_server, 'dst'))
+
+    @asynctest
+    async def test_put_cancel(self):
+        """Test cancelling a put of a file over SCP"""
+
+        await self._check_cancel('src', (self._scp_server, 'dst'))
 
     @asynctest
     async def test_put_preserve(self):
@@ -4850,6 +5110,13 @@ class _TestSCP(_CheckSCP):
 
         await self._check_progress((self._scp_server, 'src'),
                                    (self._scp_server, 'dst'))
+
+    @asynctest
+    async def test_copy_cancel(self):
+        """Test cancelling a copy of a file over SCP"""
+
+        await self._check_cancel((self._scp_server, 'src'),
+                                 (self._scp_server, 'dst'))
 
     @asynctest
     async def test_copy_preserve(self):
@@ -5088,7 +5355,7 @@ class _TestSCPAttrs(_CheckSCP):
 
         try:
             self._create_file('src')
-            await scp((self._scp_server, 'src'), 'dst')
+            await scp((self._scp_server, 'src*'), 'dst')
             self._check_file('src', 'dst')
         finally:
             remove('src dst')

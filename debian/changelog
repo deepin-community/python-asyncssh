@@ -1,3 +1,33 @@
+python-asyncssh (2.16.0-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+
+ -- Colin Watson <cjwatson@debian.org>  Mon, 19 Aug 2024 11:59:06 +0100
+
+python-asyncssh (2.15.0-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release (closes: #1076423):
+    - Hide cryptography 37.0.0 deprecation warnings (closes: #1069811).
+    - CVE-2023-48795: Implemented "strict kex" support and other
+      countermeasures to protect against the Terrapin Attack (closes:
+      #1059007).
+    - CVE-2023-46445, CVE-2023-46446: Hardened AsyncSSH state machine
+      against potential message injection attacks (closes: #1055999,
+      #1056000).
+  * Build-depend on openssl-provider-legacy where available; some tests need
+    it.
+  * Drop "Make Sphinx use default theme" and "Revert fido 0.9.2 support"
+    patches, as the relevant dependencies have since been upgraded.
+  * Deduplicate results from getaddrinfo (closes: #1052788).
+  * Enable PKCS#11 tests at build time, since python3-pkcs11 is now
+    packaged.
+  * Use pybuild-plugin-pyproject.
+  * Run tests using pytest.
+
+ -- Colin Watson <cjwatson@debian.org>  Sun, 18 Aug 2024 12:25:04 +0100
+
 python-asyncssh (2.10.1-2) unstable; urgency=medium
 
   * Team Upload.

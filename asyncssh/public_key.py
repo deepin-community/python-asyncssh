@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -20,7 +20,9 @@
 
 """SSH asymmetric encryption handlers"""
 
+import asyncio
 import binascii
+import inspect
 import os
 import re
 import time
@@ -70,6 +72,7 @@ _Time = Union[int, float, datetime, str]
 _PubKeyAlgMap = Dict[bytes, Type['SSHKey']]
 _CertAlgMap = Dict[bytes, Tuple[Optional[Type['SSHKey']],
                                 Type['SSHCertificate']]]
+_CertSigAlgMap = Dict[bytes, bytes]
 _CertVersionMap = Dict[Tuple[bytes, int],
                        Tuple[bytes, Type['SSHOpenSSHCertificate']]]
 
@@ -128,6 +131,7 @@ _default_x509_certificate_algs: List[bytes] = []
 
 _public_key_alg_map: _PubKeyAlgMap = {}
 _certificate_alg_map: _CertAlgMap = {}
+_certificate_sig_alg_map: _CertSigAlgMap = {}
 _certificate_version_map: _CertVersionMap = {}
 _pem_map: _PEMMap = {}
 _pkcs8_oid_map: _PKCS8OIDMap = {}
@@ -238,9 +242,10 @@ class SSHKey:
 
     algorithm: bytes = b''
     sig_algorithms: Sequence[bytes] = ()
+    cert_algorithms: Sequence[bytes] = ()
     x509_algorithms: Sequence[bytes] = ()
     all_sig_algorithms: Set[bytes] = set()
-    default_hash_name: str = ''
+    default_x509_hash: str = ''
     pem_name: bytes = b''
     pkcs8_oid: Optional[ObjectIdentifier] = None
     use_executor: bool = False
@@ -259,13 +264,13 @@ class SSHKey:
 
     @classmethod
     def make_private(cls, key_params: object) -> 'SSHKey':
-        """Construct an RSA private key"""
+        """Construct a private key"""
 
         raise NotImplementedError
 
     @classmethod
     def make_public(cls, key_params: object) -> 'SSHKey':
-        """Construct an RSA public key"""
+        """Construct a public key"""
 
         raise NotImplementedError
 
@@ -317,6 +322,7 @@ class SSHKey:
                               principals: _CertPrincipals,
                               valid_after: _Time, valid_before: _Time,
                               cert_options: _OpenSSHCertOptions,
+                              sig_alg_name: DefTuple[str],
                               comment: DefTuple[_Comment]) -> \
             'SSHOpenSSHCertificate':
         """Generate a new SSH certificate"""
@@ -333,6 +339,11 @@ class SSHKey:
             raise ValueError('Valid before time must be later than '
                              'valid after time')
 
+        if sig_alg_name == ():
+            sig_alg = self.sig_algorithms[0]
+        else:
+            sig_alg = cast(str, sig_alg_name).encode()
+
         if comment == ():
             comment = key.get_comment_bytes()
 
@@ -346,7 +357,8 @@ class SSHKey:
 
         return cert_handler.generate(self, algorithm, key, serial, cert_type,
                                      key_id, principals, valid_after,
-                                     valid_before, cert_options, comment)
+                                     valid_before, cert_options,
+                                     sig_alg, comment)
 
     def _generate_x509_certificate(self, key: 'SSHKey', subject: str,
                                    issuer: Optional[str],
@@ -378,7 +390,7 @@ class SSHKey:
                              'valid after time')
 
         if hash_name == ():
-            hash_name = key.default_hash_name
+            hash_name = key.default_x509_hash
 
         if comment == ():
             comment = key.get_comment_bytes()
@@ -626,24 +638,21 @@ class SSHKey:
         result.set_filename(self._filename)
         return result
 
-    def generate_user_certificate(self, user_key: 'SSHKey', key_id: str,
-                                  version: int = 1, serial: int = 0,
-                                  principals: _CertPrincipals = (),
-                                  valid_after: _Time = 0,
-                                  valid_before: _Time = 0xffffffffffffffff,
-                                  force_command: str = None,
-                                  source_address: Sequence[str] = None,
-                                  permit_x11_forwarding: bool = True,
-                                  permit_agent_forwarding: bool = True,
-                                  permit_port_forwarding: bool = True,
-                                  permit_pty: bool = True,
-                                  permit_user_rc: bool = True,
-                                  touch_required: bool = True,
-                                  comment: DefTuple[_Comment] = ()) -> \
-            'SSHOpenSSHCertificate':
+    def generate_user_certificate(
+            self, user_key: 'SSHKey', key_id: str, version: int = 1,
+            serial: int = 0, principals: _CertPrincipals = (),
+            valid_after: _Time = 0, valid_before: _Time = 0xffffffffffffffff,
+            force_command: Optional[str] = None,
+            source_address: Optional[Sequence[str]] = None,
+            permit_x11_forwarding: bool = True,
+            permit_agent_forwarding: bool = True,
+            permit_port_forwarding: bool = True, permit_pty: bool = True,
+            permit_user_rc: bool = True, touch_required: bool = True,
+            sig_alg: DefTuple[str] = (),
+            comment: DefTuple[_Comment] = ()) -> 'SSHOpenSSHCertificate':
         """Generate a new SSH user certificate
 
-           This method returns an SSH user certifcate with the requested
+           This method returns an SSH user certificate with the requested
            attributes signed by this private key.
 
            :param user_key:
@@ -689,6 +698,8 @@ class SSHKey:
            :param touch_required: (optional)
                Whether or not to require the user to touch the security key
                when authenticating with it, defaulting to `True`.
+           :param sig_alg: (optional)
+               The algorithm to use when signing the new certificate.
            :param comment:
                The comment to associate with this certificate. By default,
                the comment will be set to the comment currently set on
@@ -706,6 +717,7 @@ class SSHKey:
            :type permit_pty: `bool`
            :type permit_user_rc: `bool`
            :type touch_required: `bool`
+           :type sig_alg: `str`
            :type comment: `str`, `bytes`, or `None`
 
            :returns: :class:`SSHCertificate`
@@ -746,18 +758,20 @@ class SSHKey:
         return self._generate_certificate(user_key, version, serial,
                                           CERT_TYPE_USER, key_id,
                                           principals, valid_after,
-                                          valid_before, cert_options, comment)
+                                          valid_before, cert_options,
+                                          sig_alg, comment)
 
     def generate_host_certificate(self, host_key: 'SSHKey', key_id: str,
                                   version: int = 1, serial: int = 0,
                                   principals: _CertPrincipals = (),
                                   valid_after: _Time = 0,
                                   valid_before: _Time = 0xffffffffffffffff,
+                                  sig_alg: DefTuple[str] = (),
                                   comment: DefTuple[_Comment] = ()) -> \
             'SSHOpenSSHCertificate':
         """Generate a new SSH host certificate
 
-           This method returns an SSH host certifcate with the requested
+           This method returns an SSH host certificate with the requested
            attributes signed by this private key.
 
            :param host_key:
@@ -779,6 +793,8 @@ class SSHKey:
                The latest time the certificate is valid for, defaulting to
                no restriction on when the certificate stops being valid.
                See :ref:`SpecifyingTimeValues` for allowed time specifications.
+           :param sig_alg: (optional)
+               The algorithm to use when signing the new certificate.
            :param comment:
                The comment to associate with this certificate. By default,
                the comment will be set to the comment currently set on
@@ -788,6 +804,7 @@ class SSHKey:
            :type version: `int`
            :type serial: `int`
            :type principals: `str` or `list` of `str`
+           :type sig_alg: `str`
            :type comment: `str`, `bytes`, or `None`
 
            :returns: :class:`SSHCertificate`
@@ -803,21 +820,19 @@ class SSHKey:
         return self._generate_certificate(host_key, version, serial,
                                           CERT_TYPE_HOST, key_id,
                                           principals, valid_after,
-                                          valid_before, {}, comment)
+                                          valid_before, {}, sig_alg, comment)
 
-    def generate_x509_user_certificate(self, user_key: 'SSHKey', subject: str,
-                                       issuer: str = None, serial: int = None,
-                                       principals: _CertPrincipals = (),
-                                       valid_after: _Time = 0,
-                                       valid_before: _Time = 0xffffffffffffffff,
-                                       purposes: X509CertPurposes = \
-                                            'secureShellClient',
-                                       hash_alg: DefTuple[str] = (),
-                                       comment: DefTuple[_Comment] = ()) -> \
-            'SSHX509Certificate':
+    def generate_x509_user_certificate(
+            self, user_key: 'SSHKey', subject: str,
+            issuer: Optional[str] = None, serial: Optional[int] = None,
+            principals: _CertPrincipals = (), valid_after: _Time = 0,
+            valid_before: _Time = 0xffffffffffffffff,
+            purposes: X509CertPurposes = 'secureShellClient',
+            hash_alg: DefTuple[str] = (),
+            comment: DefTuple[_Comment] = ()) -> 'SSHX509Certificate':
         """Generate a new X.509 user certificate
 
-           This method returns an X.509 user certifcate with the requested
+           This method returns an X.509 user certificate with the requested
            attributes signed by this private key.
 
            :param user_key:
@@ -878,19 +893,17 @@ class SSHKey:
                                                purposes, principals, (),
                                                hash_alg, comment)
 
-    def generate_x509_host_certificate(self, host_key: 'SSHKey', subject: str,
-                                       issuer: str = None, serial: int = None,
-                                       principals: _CertPrincipals = (),
-                                       valid_after: _Time = 0,
-                                       valid_before: _Time = 0xffffffffffffffff,
-                                       purposes: X509CertPurposes = \
-                                            'secureShellServer',
-                                       hash_alg: DefTuple[str] = (),
-                                       comment: DefTuple[_Comment] = ()) -> \
-            'SSHX509Certificate':
+    def generate_x509_host_certificate(
+            self, host_key: 'SSHKey', subject: str,
+            issuer: Optional[str] = None, serial: Optional[int] = None,
+            principals: _CertPrincipals = (), valid_after: _Time = 0,
+            valid_before: _Time = 0xffffffffffffffff,
+            purposes: X509CertPurposes = 'secureShellServer',
+            hash_alg: DefTuple[str] = (),
+            comment: DefTuple[_Comment] = ()) -> 'SSHX509Certificate':
         """Generate a new X.509 host certificate
 
-           This method returns a X.509 host certifcate with the requested
+           This method returns an X.509 host certificate with the requested
            attributes signed by this private key.
 
            :param host_key:
@@ -961,7 +974,7 @@ class SSHKey:
             'SSHX509Certificate':
         """Generate a new X.509 CA certificate
 
-           This method returns a X.509 CA certifcate with the requested
+           This method returns an X.509 CA certificate with the requested
            attributes signed by this private key.
 
            :param ca_key:
@@ -1360,6 +1373,8 @@ class SSHCertificate:
                   comment: _Comment) -> 'SSHCertificate':
         """Construct an SSH certificate from packetized data"""
 
+        raise NotImplementedError
+
     def __eq__(self, other: object) -> bool:
         return (isinstance(other, type(self)) and
                 self.public_data == other.public_data)
@@ -1547,7 +1562,8 @@ class SSHOpenSSHCertificate(SSHCertificate):
                  signing_key: SSHKey, serial: int, cert_type: int,
                  key_id: str, valid_after: int, valid_before: int,
                  comment: _Comment):
-        super().__init__(algorithm, key.sig_algorithms, (algorithm,),
+        super().__init__(algorithm, key.sig_algorithms,
+                         key.cert_algorithms or (algorithm,),
                          key, data, comment)
 
         self.principals = principals
@@ -1565,7 +1581,7 @@ class SSHOpenSSHCertificate(SSHCertificate):
                  serial: int, cert_type: int, key_id: str,
                  principals: Sequence[str], valid_after: int,
                  valid_before: int, options: _OpenSSHCertOptions,
-                 comment: _Comment) -> 'SSHOpenSSHCertificate':
+                 sig_alg: bytes, comment: _Comment) -> 'SSHOpenSSHCertificate':
         """Generate a new SSH certificate"""
 
         principal_bytes = b''.join(String(p) for p in principals)
@@ -1590,7 +1606,7 @@ class SSHOpenSSHCertificate(SSHCertificate):
                                      cert_extensions),
                          String(signing_key.public_data)))
 
-        data += String(signing_key.sign(data, signing_key.algorithm))
+        data += String(signing_key.sign(data, sig_alg))
 
         signing_key = signing_key.convert_to_public()
 
@@ -1601,7 +1617,7 @@ class SSHOpenSSHCertificate(SSHCertificate):
     @classmethod
     def construct(cls, packet: SSHPacket, algorithm: bytes,
                   key_handler: Optional[Type[SSHKey]],
-                  comment: _Comment) -> 'SSHCertificate':
+                  comment: _Comment) -> 'SSHOpenSSHCertificate':
         """Construct an SSH certificate from packetized data"""
 
         assert key_handler is not None
@@ -1876,6 +1892,14 @@ class SSHX509Certificate(SSHCertificate):
                 pass
 
     @classmethod
+    def construct(cls, packet: SSHPacket, algorithm: bytes,
+                  key_handler: Optional[Type[SSHKey]],
+                  comment: _Comment) -> 'SSHX509Certificate':
+        """Construct an SSH X.509 certificate from packetized data"""
+
+        raise RuntimeError # pragma: no cover
+
+    @classmethod
     def generate(cls, signing_key: 'SSHKey', key: 'SSHKey', subject: str,
                  issuer: Optional[str], serial: Optional[int],
                  valid_after: int, valid_before: int, ca: bool,
@@ -2031,7 +2055,8 @@ class SSHKeyPair:
                  sig_algorithms: Sequence[bytes],
                  host_key_algorithms: Sequence[bytes],
                  public_data: bytes, comment: _Comment,
-                 cert: SSHCertificate = None, filename: bytes = None,
+                 cert: Optional[SSHCertificate] = None,
+                 filename: Optional[bytes] = None,
                  use_executor: bool = False):
         self.key_algorithm = algorithm
         self.key_public_data = public_data
@@ -2072,6 +2097,18 @@ class SSHKeyPair:
         """
 
         return self._key_type
+
+    @property
+    def has_cert(self) -> bool:
+        """ Return if this key pair has an associated cert"""
+
+        return bool(self._cert)
+
+    @property
+    def has_x509_chain(self) -> bool:
+        """ Return if this key pair has an associated X.509 cert chain"""
+
+        return self._cert.is_x509_chain if self._cert else False
 
     def get_algorithm(self) -> str:
         """Return the algorithm associated with this key pair"""
@@ -2164,11 +2201,16 @@ class SSHKeyPair:
     def set_sig_algorithm(self, sig_algorithm: bytes) -> None:
         """Set the signature algorithm to use when signing data"""
 
+        try:
+            sig_algorithm = _certificate_sig_alg_map[sig_algorithm]
+        except KeyError:
+            pass
+
         self.sig_algorithm = sig_algorithm
 
-        if not self._cert:
+        if not self.has_cert:
             self.algorithm = sig_algorithm
-        elif self._cert.is_x509_chain:
+        elif self.has_x509_chain:
             self.algorithm = sig_algorithm
 
             cert = cast('SSHX509CertificateChain', self._cert)
@@ -2176,6 +2218,9 @@ class SSHKeyPair:
 
     def sign(self, data: bytes) -> bytes:
         """Sign a block of data with this private key"""
+
+        # pylint: disable=no-self-use
+        raise RuntimeError # pragma: no cover
 
 
 class SSHLocalKeyPair(SSHKeyPair):
@@ -2189,8 +2234,8 @@ class SSHLocalKeyPair(SSHKeyPair):
 
     _key_type = 'local'
 
-    def __init__(self, key: SSHKey, pubkey: SSHKey = None,
-                 cert: SSHCertificate = None):
+    def __init__(self, key: SSHKey, pubkey: Optional[SSHKey] = None,
+                 cert: Optional[SSHCertificate] = None):
         if pubkey and pubkey.public_data != key.public_data:
             raise ValueError('Public key mismatch')
 
@@ -2371,7 +2416,9 @@ def _match_next(data: bytes, keytype: bytes, public: bool = False) -> \
     return None, (), len(data)
 
 
-def _decode_pkcs1_private(pem_name: bytes, key_data: object) -> SSHKey:
+def _decode_pkcs1_private(
+        pem_name: bytes, key_data: object,
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> SSHKey:
     """Decode a PKCS#1 format private key"""
 
     handler = _pem_map.get(pem_name)
@@ -2383,6 +2430,10 @@ def _decode_pkcs1_private(pem_name: bytes, key_data: object) -> SSHKey:
     if key_params is None:
         raise KeyImportError('Invalid %s private key' %
                              pem_name.decode('ascii'))
+
+    if pem_name == b'RSA':
+        key_params = cast(Tuple, key_params) + \
+            (unsafe_skip_rsa_key_validation,)
 
     return handler.make_private(key_params)
 
@@ -2403,7 +2454,9 @@ def _decode_pkcs1_public(pem_name: bytes, key_data: object) -> SSHKey:
     return handler.make_public(key_params)
 
 
-def _decode_pkcs8_private(key_data: object) -> SSHKey:
+def _decode_pkcs8_private(
+        key_data: object,
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> SSHKey:
     """Decode a PKCS#8 format private key"""
 
     if (isinstance(key_data, tuple) and len(key_data) >= 3 and
@@ -2423,6 +2476,10 @@ def _decode_pkcs8_private(key_data: object) -> SSHKey:
             raise KeyImportError('Invalid %s private key' %
                                  handler.pem_name.decode('ascii')
                                  if handler.pem_name else 'PKCS#8')
+
+        if alg == ObjectIdentifier('1.2.840.113549.1.1.1'):
+            key_params = cast(Tuple, key_params) + \
+                (unsafe_skip_rsa_key_validation,)
 
         return handler.make_private(key_params)
     else:
@@ -2455,8 +2512,9 @@ def _decode_pkcs8_public(key_data: object) -> SSHKey:
         raise KeyImportError('Invalid PKCS#8 public key')
 
 
-def _decode_openssh_private(data: bytes,
-                            passphrase: Optional[BytesOrStr]) -> SSHKey:
+def _decode_openssh_private(
+        data: bytes, passphrase: Optional[BytesOrStr],
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> SSHKey:
     """Decode an OpenSSH format private key"""
 
     try:
@@ -2547,6 +2605,10 @@ def _decode_openssh_private(data: bytes,
         if len(pad) >= block_size or pad != bytes(range(1, len(pad) + 1)):
             raise KeyImportError('Invalid OpenSSH private key')
 
+        if alg == b'ssh-rsa':
+            key_params = cast(Tuple, key_params) + \
+                (unsafe_skip_rsa_key_validation,)
+
         key = handler.make_private(key_params)
         key.set_comment(comment)
         return key
@@ -2578,8 +2640,9 @@ def _decode_openssh_public(data: bytes) -> SSHKey:
         raise KeyImportError('Invalid OpenSSH private key') from None
 
 
-def _decode_der_private(key_data: object,
-                        passphrase: Optional[BytesOrStr]) -> SSHKey:
+def _decode_der_private(
+        key_data: object, passphrase: Optional[BytesOrStr],
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> SSHKey:
     """Decode a DER format private key"""
 
     # First, if there's a passphrase, try to decrypt PKCS#8
@@ -2592,7 +2655,7 @@ def _decode_der_private(key_data: object,
 
     # Then, try to decode PKCS#8
     try:
-        return _decode_pkcs8_private(key_data)
+        return _decode_pkcs8_private(key_data, unsafe_skip_rsa_key_validation)
     except KeyImportError:
         # PKCS#8 failed - try PKCS#1 instead
         pass
@@ -2600,7 +2663,8 @@ def _decode_der_private(key_data: object,
     # If that fails, try each of the possible PKCS#1 encodings
     for pem_name in _pem_map:
         try:
-            return _decode_pkcs1_private(pem_name, key_data)
+            return _decode_pkcs1_private(pem_name, key_data,
+                                         unsafe_skip_rsa_key_validation)
         except KeyImportError:
             # Try the next PKCS#1 encoding
             pass
@@ -2636,13 +2700,15 @@ def _decode_der_certificate(data: bytes,
     return SSHX509Certificate.construct_from_der(data, comment)
 
 
-def _decode_pem_private(pem_name: bytes, headers: Mapping[bytes, bytes],
-                        data: bytes, passphrase: Optional[BytesOrStr]) -> \
-        SSHKey:
+def _decode_pem_private(
+        pem_name: bytes, headers: Mapping[bytes, bytes],
+        data: bytes, passphrase: Optional[BytesOrStr],
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> SSHKey:
     """Decode a PEM format private key"""
 
     if pem_name == b'OPENSSH':
-        return _decode_openssh_private(data, passphrase)
+        return _decode_openssh_private(data, passphrase,
+                                       unsafe_skip_rsa_key_validation)
 
     if headers.get(b'Proc-Type') == b'4,ENCRYPTED':
         if passphrase is None:
@@ -2684,9 +2750,10 @@ def _decode_pem_private(pem_name: bytes, headers: Mapping[bytes, bytes],
                                  'private key') from None
 
     if pem_name:
-        return _decode_pkcs1_private(pem_name, key_data)
+        return _decode_pkcs1_private(pem_name, key_data,
+                                     unsafe_skip_rsa_key_validation)
     else:
-        return _decode_pkcs8_private(key_data)
+        return _decode_pkcs8_private(key_data, unsafe_skip_rsa_key_validation)
 
 
 def _decode_pem_public(pem_name: bytes, data: bytes) -> SSHKey:
@@ -2719,8 +2786,10 @@ def _decode_pem_certificate(pem_name: bytes, data: bytes) -> SSHCertificate:
     return SSHX509Certificate.construct_from_der(data)
 
 
-def _decode_private(data: bytes, passphrase: Optional[BytesOrStr]) -> \
-        Tuple[Optional[SSHKey], Optional[int]]:
+def _decode_private(
+        data: bytes, passphrase: Optional[BytesOrStr],
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> \
+            Tuple[Optional[SSHKey], Optional[int]]:
     """Decode a private key"""
 
     fmt, key_info, end = _match_next(data, b'PRIVATE KEY')
@@ -2728,10 +2797,12 @@ def _decode_private(data: bytes, passphrase: Optional[BytesOrStr]) -> \
     key: Optional[SSHKey]
 
     if fmt == 'der':
-        key = _decode_der_private(key_info[0], passphrase)
+        key = _decode_der_private(key_info[0], passphrase,
+                                  unsafe_skip_rsa_key_validation)
     elif fmt == 'pem':
         pem_name, headers, data = key_info
-        key = _decode_pem_private(pem_name, headers, data, passphrase)
+        key = _decode_pem_private(pem_name, headers, data, passphrase,
+                                  unsafe_skip_rsa_key_validation)
     else:
         key = None
 
@@ -2768,7 +2839,7 @@ def _decode_public(data: bytes) -> Tuple[Optional[SSHKey], Optional[int]]:
         if fmt == 'pem' and key_info[0] == b'OPENSSH':
             key = _decode_openssh_public(key_info[2])
         else:
-            key, _ = _decode_private(data, None)
+            key, _ = _decode_private(data, None, False)
 
             if key:
                 key = key.convert_to_public()
@@ -2805,14 +2876,16 @@ def _decode_certificate(data: bytes) -> \
     return cert, end
 
 
-def _decode_private_list(data: bytes, passphrase: Optional[BytesOrStr]) -> \
-        Sequence[SSHKey]:
+def _decode_private_list(
+        data: bytes, passphrase: Optional[BytesOrStr],
+        unsafe_skip_rsa_key_validation: Optional[bool]) -> Sequence[SSHKey]:
     """Decode a private key list"""
 
     keys: List[SSHKey] = []
 
     while data:
-        key, end = _decode_private(data, passphrase)
+        key, end = _decode_private(data, passphrase,
+                                   unsafe_skip_rsa_key_validation)
 
         if key:
             keys.append(key)
@@ -2862,7 +2935,8 @@ def register_sk_alg(sk_alg: int, handler: Type[SSHKey], *args: object) -> None:
 
 def register_public_key_alg(algorithm: bytes, handler: Type[SSHKey],
                             default: bool,
-                            sig_algorithms: Sequence[bytes] = None) -> None:
+                            sig_algorithms: Optional[Sequence[bytes]] = \
+                                None) -> None:
     """Register a new public key algorithm"""
 
     if not sig_algorithms:
@@ -2895,6 +2969,8 @@ def register_certificate_alg(version: int, algorithm: bytes,
         _default_certificate_algs.append(cert_algorithm)
 
     _certificate_alg_map[cert_algorithm] = (key_handler, cert_handler)
+
+    _certificate_sig_alg_map[cert_algorithm] = algorithm
 
     _certificate_version_map[algorithm, version] = \
         (cert_algorithm, cert_handler)
@@ -3088,8 +3164,9 @@ def generate_private_key(alg_name: str, comment: _Comment = None,
     key.set_comment(comment)
     return key
 
-def import_private_key(data: BytesOrStr,
-                       passphrase: Optional[BytesOrStr] = None) -> SSHKey:
+def import_private_key(
+        data: BytesOrStr, passphrase: Optional[BytesOrStr] = None,
+        unsafe_skip_rsa_key_validation: Optional[bool] = None) -> SSHKey:
     """Import a private key
 
        This function imports a private key encoded in PKCS#1 or PKCS#8 DER
@@ -3100,8 +3177,13 @@ def import_private_key(data: BytesOrStr,
            The data to import.
        :param passphrase: (optional)
            The passphrase to use to decrypt the key.
+       :param unsafe_skip_rsa_key_validation: (optional)
+           Whether or not to skip key validation when loading RSA private
+           keys, defaulting to performing these checks unless changed by
+           calling :func:`set_default_skip_rsa_key_validation`.
        :type data: `bytes` or ASCII `str`
        :type passphrase: `str` or `bytes`
+       :type unsafe_skip_rsa_key_validation: bool
 
        :returns: An :class:`SSHKey` private key
 
@@ -3113,7 +3195,7 @@ def import_private_key(data: BytesOrStr,
         except UnicodeEncodeError:
             raise KeyImportError('Invalid encoding for key') from None
 
-    key, _ = _decode_private(data, passphrase)
+    key, _ = _decode_private(data, passphrase, unsafe_skip_rsa_key_validation)
 
     if key:
         return key
@@ -3121,12 +3203,14 @@ def import_private_key(data: BytesOrStr,
         raise KeyImportError('Invalid private key')
 
 
-def import_private_key_and_certs(data: bytes,
-                                 passphrase: Optional[BytesOrStr] = None) -> \
-        Tuple[SSHKey, Optional[SSHX509CertificateChain]]:
+def import_private_key_and_certs(
+        data: bytes, passphrase: Optional[BytesOrStr] = None,
+        unsafe_skip_rsa_key_validation: Optional[bool] = None) -> \
+            Tuple[SSHKey, Optional[SSHX509CertificateChain]]:
     """Import a private key and optional certificate chain"""
 
-    key, end = _decode_private(data, passphrase)
+    key, end = _decode_private(data, passphrase,
+                               unsafe_skip_rsa_key_validation)
 
     if key:
         return key, import_certificate_chain(data[end:])
@@ -3222,8 +3306,9 @@ def import_certificate_subject(data: str) -> str:
     raise KeyImportError('Invalid certificate subject')
 
 
-def read_private_key(filename: FilePath,
-                     passphrase: Optional[BytesOrStr] = None) -> SSHKey:
+def read_private_key(
+        filename: FilePath, passphrase: Optional[BytesOrStr] = None,
+        unsafe_skip_rsa_key_validation: Optional[bool] = None) -> SSHKey:
     """Read a private key from a file
 
        This function reads a private key from a file. See the function
@@ -3234,26 +3319,34 @@ def read_private_key(filename: FilePath,
            The file to read the key from.
        :param passphrase: (optional)
            The passphrase to use to decrypt the key.
+       :param unsafe_skip_rsa_key_validation: (optional)
+           Whether or not to skip key validation when loading RSA private
+           keys, defaulting to performing these checks unless changed by
+           calling :func:`set_default_skip_rsa_key_validation`.
        :type filename: :class:`PurePath <pathlib.PurePath>` or `str`
        :type passphrase: `str` or `bytes`
+       :type unsafe_skip_rsa_key_validation: bool
 
        :returns: An :class:`SSHKey` private key
 
     """
 
-    key = import_private_key(read_file(filename), passphrase)
+    key = import_private_key(read_file(filename), passphrase,
+                             unsafe_skip_rsa_key_validation)
 
     key.set_filename(filename)
 
     return key
 
 
-def read_private_key_and_certs(filename: FilePath,
-                               passphrase: Optional[BytesOrStr] = None) -> \
-        Tuple[SSHKey, Optional[SSHX509CertificateChain]]:
+def read_private_key_and_certs(
+        filename: FilePath, passphrase: Optional[BytesOrStr] = None,
+        unsafe_skip_rsa_key_validation: Optional[bool] = None) -> \
+            Tuple[SSHKey, Optional[SSHX509CertificateChain]]:
     """Read a private key and optional certificate chain from a file"""
 
-    key, cert = import_private_key_and_certs(read_file(filename), passphrase)
+    key, cert = import_private_key_and_certs(read_file(filename), passphrase,
+                                             unsafe_skip_rsa_key_validation)
 
     key.set_filename(filename)
 
@@ -3300,9 +3393,10 @@ def read_certificate(filename: FilePath) -> SSHCertificate:
     return import_certificate(read_file(filename))
 
 
-def read_private_key_list(filename: FilePath,
-                          passphrase: Optional[BytesOrStr] = None) -> \
-        Sequence[SSHKey]:
+def read_private_key_list(
+        filename: FilePath, passphrase: Optional[BytesOrStr] = None,
+        unsafe_skip_rsa_key_validation: Optional[bool] = None) -> \
+            Sequence[SSHKey]:
     """Read a list of private keys from a file
 
        This function reads a list of private keys from a file. See the
@@ -3314,14 +3408,20 @@ def read_private_key_list(filename: FilePath,
            The file to read the keys from.
        :param passphrase: (optional)
            The passphrase to use to decrypt the keys.
+       :param unsafe_skip_rsa_key_validation: (optional)
+           Whether or not to skip key validation when loading RSA private
+           keys, defaulting to performing these checks unless changed by
+           calling :func:`set_default_skip_rsa_key_validation`.
        :type filename: :class:`PurePath <pathlib.PurePath>` or `str`
        :type passphrase: `str` or `bytes`
+       :type unsafe_skip_rsa_key_validation: bool
 
        :returns: A list of :class:`SSHKey` private keys
 
     """
 
-    keys = _decode_private_list(read_file(filename), passphrase)
+    keys = _decode_private_list(read_file(filename), passphrase,
+                                unsafe_skip_rsa_key_validation)
 
     for key in keys:
         key.set_filename(filename)
@@ -3370,10 +3470,13 @@ def read_certificate_list(filename: FilePath) -> Sequence[SSHCertificate]:
     return _decode_certificate_list(read_file(filename))
 
 
-def load_keypairs(keylist: KeyPairListArg,
-                  passphrase: Optional[BytesOrStr] = None,
-                  certlist: CertListArg = (), skip_public: bool = False,
-                  ignore_encrypted: bool = False) -> Sequence[SSHKeyPair]:
+def load_keypairs(
+        keylist: KeyPairListArg, passphrase: Optional[BytesOrStr] = None,
+        certlist: CertListArg = (), skip_public: bool = False,
+        ignore_encrypted: bool = False,
+        unsafe_skip_rsa_key_validation: Optional[bool] = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None) -> \
+            Sequence[SSHKeyPair]:
     """Load SSH private keys and optional matching certificates
 
        This function loads a list of SSH keys and optional matching
@@ -3385,7 +3488,8 @@ def load_keypairs(keylist: KeyPairListArg,
        :param keylist:
            The list of private keys and certificates to load.
        :param passphrase: (optional)
-           The passphrase to use to decrypt private keys.
+           The passphrase to use to decrypt the keys, or a `callable` which
+           takes a filename and returns the passphrase to decrypt it.
        :param certlist: (optional)
            A list of certificates to attempt to pair with the provided
            list of private keys.
@@ -3393,10 +3497,15 @@ def load_keypairs(keylist: KeyPairListArg,
            An internal parameter used to skip public keys and certificates
            when IdentitiesOnly and IdentityFile are used to specify a
            mixture of private and public keys.
+       :param unsafe_skip_rsa_key_validation: (optional)
+           Whether or not to skip key validation when loading RSA private
+           keys, defaulting to performing these checks unless changed by
+           calling :func:`set_default_skip_rsa_key_validation`.
        :type keylist: *see* :ref:`SpecifyingPrivateKeys`
        :type passphrase: `str` or `bytes`
        :type certlist: *see* :ref:`SpecifyingCertificates`
        :type skip_public: `bool`
+       :type unsafe_skip_rsa_key_validation: bool
 
        :returns: A list of :class:`SSHKeyPair` objects
 
@@ -3410,8 +3519,23 @@ def load_keypairs(keylist: KeyPairListArg,
 
     if isinstance(keylist, (PurePath, str)):
         try:
-            priv_keys = read_private_key_list(keylist, passphrase)
-            keys_to_load = [keylist] if len(priv_keys) <= 1 else priv_keys
+            if callable(passphrase):
+                resolved_passphrase = passphrase(str(keylist))
+            else:
+                resolved_passphrase = passphrase
+
+            if loop and inspect.isawaitable(resolved_passphrase):
+                resolved_passphrase = asyncio.run_coroutine_threadsafe(
+                    resolved_passphrase, loop).result()
+
+            priv_keys = read_private_key_list(keylist, resolved_passphrase,
+                                              unsafe_skip_rsa_key_validation)
+
+            if len(priv_keys) <= 1:
+                keys_to_load = [keylist]
+                passphrase = resolved_passphrase
+            else:
+                keys_to_load = priv_keys
         except KeyImportError:
             keys_to_load = [keylist]
     elif isinstance(keylist, (tuple, bytes, SSHKey, SSHKeyPair)):
@@ -3437,22 +3561,35 @@ def load_keypairs(keylist: KeyPairListArg,
             if isinstance(key_to_load, (PurePath, str)):
                 key_prefix = str(key_to_load)
 
+                if callable(passphrase):
+                    resolved_passphrase = passphrase(key_prefix)
+                else:
+                    resolved_passphrase = passphrase
+
+                if loop and inspect.isawaitable(resolved_passphrase):
+                    resolved_passphrase = asyncio.run_coroutine_threadsafe(
+                        resolved_passphrase, loop).result()
+
                 if allow_certs:
-                    key, certs_to_load = \
-                        read_private_key_and_certs(key_to_load, passphrase)
+                    key, certs_to_load = read_private_key_and_certs(
+                        key_to_load, resolved_passphrase,
+                        unsafe_skip_rsa_key_validation)
 
                     if not certs_to_load:
                         certs_to_load = key_prefix + '-cert.pub'
                 else:
-                    key = read_private_key(key_to_load, passphrase)
+                    key = read_private_key(key_to_load, resolved_passphrase,
+                                           unsafe_skip_rsa_key_validation)
 
                 pubkey_to_load = key_prefix + '.pub'
             elif isinstance(key_to_load, bytes):
                 if allow_certs:
-                    key, certs_to_load = \
-                        import_private_key_and_certs(key_to_load, passphrase)
+                    key, certs_to_load = import_private_key_and_certs(
+                        key_to_load, passphrase,
+                        unsafe_skip_rsa_key_validation)
                 else:
-                    key = import_private_key(key_to_load, passphrase)
+                    key = import_private_key(key_to_load, passphrase,
+                                             unsafe_skip_rsa_key_validation)
             else:
                 key = key_to_load
         except KeyImportError as exc:
@@ -3696,7 +3833,8 @@ def load_default_identities() -> Sequence[bytes]:
     return result
 
 
-def load_resident_keys(pin: str, *, application: str = 'ssh:', user: str = None,
+def load_resident_keys(pin: str, *, application: str = 'ssh:',
+                       user: Optional[str] = None,
                        touch_required: bool = True) -> Sequence[SSHKey]:
     """Load keys resident on attached FIDO2 security keys
 
