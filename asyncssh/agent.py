@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2016-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -21,12 +21,11 @@
 """SSH agent client"""
 
 import asyncio
-import errno
 import os
 import sys
 from types import TracebackType
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Type, Union
-from typing_extensions import Protocol
+from typing_extensions import Protocol, Self
 
 from .listener import SSHForwardListener
 from .misc import async_context_manager, maybe_wait_closed
@@ -58,17 +57,10 @@ class AgentWriter(Protocol):
         """Wait for the connection to the SSH agent to close"""
 
 
-try:
-    if sys.platform == 'win32': # pragma: no cover
-        from .agent_win32 import open_agent
-    else:
-        from .agent_unix import open_agent
-except ImportError as _exc: # pragma: no cover
-    async def open_agent(agent_path: Optional[str]) -> \
-            Tuple[AgentReader, AgentWriter]:
-        """Dummy function if we're unable to import agent support"""
-
-        raise OSError(errno.ENOENT, 'Agent support unavailable: %s' % str(_exc))
+if sys.platform == 'win32': # pragma: no cover
+    from .agent_win32 import open_agent
+else:
+    from .agent_unix import open_agent
 
 
 class _SupportsOpenAgentConnection(Protocol):
@@ -78,7 +70,7 @@ class _SupportsOpenAgentConnection(Protocol):
         """Open a forwarded ssh-agent connection back to the client"""
 
 
-_AgentPath = Union[None, str, _SupportsOpenAgentConnection]
+_AgentPath = Union[str, _SupportsOpenAgentConnection]
 
 
 # Client request message numbers
@@ -149,6 +141,18 @@ class SSHAgentKeyPair(SSHKeyPair):
         self._is_cert = is_cert
         self._flags = 0
 
+    @property
+    def has_cert(self) -> bool:
+        """ Return if this key pair has an associated cert"""
+
+        return self._is_cert
+
+    @property
+    def has_x509_chain(self) -> bool:
+        """ Return if this key pair has an associated X.509 cert chain"""
+
+        return False
+
     def set_certificate(self, cert: SSHCertificate) -> None:
         """Set certificate to use with this key"""
 
@@ -161,7 +165,7 @@ class SSHAgentKeyPair(SSHKeyPair):
 
         super().set_sig_algorithm(sig_algorithm)
 
-        if sig_algorithm == b'rsa-sha2-256':
+        if sig_algorithm in (b'rsa-sha2-256', b'x509v3-rsa2048-sha256'):
             self._flags |= SSH_AGENT_RSA_SHA2_256
         elif sig_algorithm == b'rsa-sha2-512':
             self._flags |= SSH_AGENT_RSA_SHA2_512
@@ -186,7 +190,7 @@ class SSHAgentClient:
         self._writer: Optional[AgentWriter] = None
         self._lock = asyncio.Lock()
 
-    async def __aenter__(self) -> 'SSHAgentClient':
+    async def __aenter__(self) -> Self:
         """Allow SSHAgentClient to be used as an async context manager"""
 
         return self
@@ -222,7 +226,7 @@ class SSHAgentClient:
     async def connect(self) -> None:
         """Connect to the SSH agent"""
 
-        if isinstance(self._agent_path, str) or self._agent_path is None:
+        if isinstance(self._agent_path, str):
             self._reader, self._writer = await open_agent(self._agent_path)
         else:
             self._reader, self._writer = \
@@ -248,7 +252,7 @@ class SSHAgentClient:
 
                 resplen = int.from_bytes((await reader.readexactly(4)), 'big')
 
-                resp = SSHPacket((await reader.readexactly(resplen)))
+                resp = SSHPacket(await reader.readexactly(resplen))
                 resptype = resp.get_byte()
 
                 return resptype, resp
@@ -294,7 +298,7 @@ class SSHAgentClient:
             resp.check_end()
             return result
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def sign(self, key_blob: bytes, data: bytes,
                    flags: int = 0) -> bytes:
@@ -311,10 +315,11 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             raise ValueError('Unable to sign with requested key')
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def add_keys(self, keylist: KeyPairListArg = (),
-                       passphrase: str = None, lifetime: int = None,
+                       passphrase: Optional[str] = None,
+                       lifetime: Optional[int] = None,
                        confirm: bool = False) -> None:
         """Add keys to the agent
 
@@ -392,10 +397,11 @@ class SSHAgentClient:
                 if not ignore_failures:
                     raise ValueError('Unable to add key')
             else:
-                raise ValueError('Unknown SSH agent response: %d' % resptype)
+                raise ValueError(f'Unknown SSH agent response: {resptype}')
 
-    async def add_smartcard_keys(self, provider: str, pin: str = None,
-                                 lifetime: int = None,
+    async def add_smartcard_keys(self, provider: str,
+                                 pin: Optional[str] = None,
+                                 lifetime: Optional[int] = None,
                                  confirm: bool = False) -> None:
         """Store keys associated with a smart card in the agent
 
@@ -432,7 +438,7 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             raise ValueError('Unable to add keys')
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def remove_keys(self, keylist: Sequence[SSHKeyPair]) -> None:
         """Remove a key stored in the agent
@@ -455,10 +461,10 @@ class SSHAgentClient:
             elif resptype == SSH_AGENT_FAILURE:
                 raise ValueError('Key not found')
             else:
-                raise ValueError('Unknown SSH agent response: %d' % resptype)
+                raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def remove_smartcard_keys(self, provider: str,
-                                    pin: str = None) -> None:
+                                    pin: Optional[str] = None) -> None:
         """Remove keys associated with a smart card stored in the agent
 
            :param provider:
@@ -481,7 +487,7 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             raise ValueError('Keys not found')
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def remove_all(self) -> None:
         """Remove all keys stored in the agent
@@ -498,7 +504,7 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             raise ValueError('Unable to remove all keys')
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def lock(self, passphrase: str) -> None:
         """Lock the agent using the specified passphrase
@@ -522,7 +528,7 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             raise ValueError('Unable to lock SSH agent')
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def unlock(self, passphrase: str) -> None:
         """Unlock the agent using the specified passphrase
@@ -546,7 +552,7 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             raise ValueError('Unable to unlock SSH agent')
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     async def query_extensions(self) -> Sequence[str]:
         """Return a list of extensions supported by the agent
@@ -575,7 +581,7 @@ class SSHAgentClient:
         elif resptype == SSH_AGENT_FAILURE:
             return []
         else:
-            raise ValueError('Unknown SSH agent response: %d' % resptype)
+            raise ValueError(f'Unknown SSH agent response: {resptype}')
 
     def close(self) -> None:
         """Close the SSH agent connection
@@ -626,7 +632,7 @@ class SSHAgentListener:
 
 
 @async_context_manager
-async def connect_agent(agent_path: _AgentPath = None) -> 'SSHAgentClient':
+async def connect_agent(agent_path: _AgentPath = '') -> 'SSHAgentClient':
     """Make a connection to the SSH agent
 
        This function attempts to connect to an ssh-agent process
@@ -654,7 +660,7 @@ async def connect_agent(agent_path: _AgentPath = None) -> 'SSHAgentClient':
     """
 
     if not agent_path:
-        agent_path = os.environ.get('SSH_AUTH_SOCK', None)
+        agent_path = os.environ.get('SSH_AUTH_SOCK', '')
 
     agent = SSHAgentClient(agent_path)
     await agent.connect()

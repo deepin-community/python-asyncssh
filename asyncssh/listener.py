@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -25,7 +25,8 @@ import errno
 import socket
 from types import TracebackType
 from typing import TYPE_CHECKING, AnyStr, Callable, Generic, List, Optional
-from typing import Sequence, Tuple, Type, Union
+from typing import Sequence, Set, Tuple, Type, Union
+from typing_extensions import Self
 
 from .forward import SSHForwarderCoro
 from .forward import SSHLocalPortForwarder, SSHLocalPathForwarder
@@ -54,7 +55,7 @@ class SSHListener:
     def __init__(self) -> None:
         self._tunnel: Optional['SSHConnection'] = None
 
-    async def __aenter__(self) -> 'SSHListener':
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, _exc_type: Optional[Type[BaseException]],
@@ -184,6 +185,11 @@ class SSHTCPClientListener(SSHClientListener, Generic[AnyStr]):
 
         return chan, self._session_factory(orig_host, orig_port)
 
+    def get_addresses(self) -> List[Tuple]:
+        """Return the socket addresses being listened on"""
+
+        return [(self._listen_host, self._listen_port)]
+
     def get_port(self) -> int:
         """Return the port number being listened on"""
 
@@ -279,9 +285,19 @@ async def create_tcp_local_listener(
     if not addrinfo: # pragma: no cover
         raise OSError('getaddrinfo() returned empty list')
 
+    seen_addrinfo: Set[Tuple] = set()
     servers: List[asyncio.AbstractServer] = []
 
-    for family, socktype, proto, _, sa in addrinfo:
+    for addrinfo_entry in addrinfo:
+        # Work around an issue where getaddrinfo() on some systems may
+        # return duplicate results, causing bind to fail.
+        if addrinfo_entry in seen_addrinfo: # pragma: no cover
+            continue
+
+        seen_addrinfo.add(addrinfo_entry)
+
+        family, socktype, proto, _, sa = addrinfo_entry
+
         try:
             sock = socket.socket(family, socktype, proto)
         except OSError: # pragma: no cover
@@ -311,9 +327,9 @@ async def create_tcp_local_listener(
                 exc.strerror = str(exc) # type: ignore
 
             # pylint: disable=no-member
-            raise OSError(exc.errno, 'error while attempting ' # type: ignore
-                          'to bind on address %r: %s' %
-                          (sa, exc.strerror)) from None # type: ignore
+            raise OSError(exc.errno, f'error while attempting ' # type: ignore
+                          f'to bind on address {sa!r}: '
+                          f'{exc.strerror}') from None # type: ignore
 
         if listen_port == 0:
             listen_port = sock.getsockname()[1]

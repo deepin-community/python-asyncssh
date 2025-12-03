@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2025 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -31,21 +31,36 @@ from .stream import SSHSocketSessionFactory, SSHServerSessionFactory
 
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
-    from .connection import SSHServerConnection
+    from .connection import SSHClientConnection, SSHServerConnection
+    from .connection import SSHAcceptHandler
     from .channel import SSHServerChannel, SSHTCPChannel, SSHUNIXChannel
+    from .channel import SSHTunTapChannel
     from .session import SSHServerSession, SSHTCPSession, SSHUNIXSession
+    from .session import SSHTunTapSession
 
 
-_NewSession = Union[bool, 'SSHServerSession', SSHServerSessionFactory,
-                    Tuple['SSHServerChannel', 'SSHServerSession'],
-                    Tuple['SSHServerChannel', SSHServerSessionFactory]]
-_NewTCPSession = Union[bool, 'SSHTCPSession', SSHSocketSessionFactory,
-                       Tuple['SSHTCPChannel', 'SSHTCPSession'],
-                       Tuple['SSHTCPChannel', SSHSocketSessionFactory]]
-_NewUNIXSession = Union[bool, 'SSHUNIXSession', SSHSocketSessionFactory,
-                        Tuple['SSHUNIXChannel', 'SSHUNIXSession'],
-                        Tuple['SSHUNIXChannel', SSHSocketSessionFactory]]
-_NewListener = Union[bool, SSHListener]
+_NewSession = Union[
+    bool, 'SSHClientConnection',
+    MaybeAwait['SSHServerSession'], SSHServerSessionFactory,
+    Tuple['SSHServerChannel', MaybeAwait['SSHServerSession']],
+    Tuple['SSHServerChannel', SSHServerSessionFactory]]
+_NewTCPSession = Union[
+    bool, 'SSHClientConnection',
+    MaybeAwait['SSHTCPSession'], SSHSocketSessionFactory,
+    Tuple['SSHTCPChannel', MaybeAwait['SSHTCPSession']],
+    Tuple['SSHTCPChannel', SSHSocketSessionFactory]]
+_NewUNIXSession = Union[
+    bool, 'SSHClientConnection',
+    MaybeAwait['SSHUNIXSession'], SSHSocketSessionFactory,
+    Tuple['SSHUNIXChannel', MaybeAwait['SSHUNIXSession']],
+    Tuple['SSHUNIXChannel', SSHSocketSessionFactory]]
+_NewTunTapSession = Union[
+    bool, 'SSHClientConnection',
+    MaybeAwait['SSHTunTapSession'], SSHSocketSessionFactory,
+    Tuple['SSHTunTapChannel', MaybeAwait['SSHTunTapSession']],
+    Tuple['SSHTunTapChannel', SSHSocketSessionFactory]]
+_NewTCPListener = Union[bool, 'SSHAcceptHandler', MaybeAwait[SSHListener]]
+_NewUNIXListener = Union[bool, MaybeAwait[SSHListener]]
 
 
 class SSHServer:
@@ -53,6 +68,14 @@ class SSHServer:
 
        Applications may subclass this when implementing an SSH server to
        provide custom authentication and request handlers.
+
+       Whenever a new SSH server connection is accepted, a corresponding
+       SSHServer object is created and the method :meth:`connection_made`
+       is called, passing in the :class:`SSHServerConnection` object.
+
+       When the connection is closed, the method :meth:`connection_lost`
+       is called with an exception representing the reason for the
+       disconnect, or `None` if the connection was closed cleanly.
 
        The method :meth:`begin_auth` can be overridden decide whether
        or not authentication is required, and additional callbacks are
@@ -144,15 +167,18 @@ class SSHServer:
 
         return True # pragma: no cover
 
-    def auth_completed(self) -> None:
+    def auth_completed(self) -> MaybeAwait[None]:
         """Authentication was completed successfully
 
            This method is called when authentication has completed
-           succesfully. Applications may use this method to perform
+           successfully. Applications may use this method to perform
            processing based on the authenticated username or options in
            the authorized keys list or certificate associated with the
            user before any sessions are opened or forwarding requests
            are handled.
+
+           If blocking operations need to be performed when authentication
+           completes, this method may be defined as a coroutine.
 
         """
 
@@ -575,7 +601,7 @@ class SSHServer:
            authentication is supported. Applications wishing to support
            it must have this method return `True` and implement
            :meth:`get_kbdint_challenge` and :meth:`validate_kbdint_response`
-           to generate the apporiate challenges and validate the responses
+           to generate the appropriate challenges and validate the responses
            for the user being authenticated.
 
            By default, this method returns `NotImplemented` tying
@@ -677,7 +703,7 @@ class SSHServer:
            If blocking operations need to be performed before the session
            can be created, a coroutine which returns an
            :class:`SSHServerSession` object can be returned instead of
-           the session iself. This can be either returned directly or as
+           the session itself. This can be either returned directly or as
            a part of a tuple with an :class:`SSHServerChannel` object.
 
            To reject this request, this method should return `False`
@@ -729,6 +755,11 @@ class SSHServer:
            :exc:`ChannelOpenError` exception with the reason for
            the failure.
 
+           If the application wishes to tunnel the connection over
+           another SSH connection, this method should return an
+           :class:`SSHClientConnection` connected to the desired
+           tunnel host.
+
            If the application wishes to process the data on the
            connection itself, this method should return either an
            :class:`SSHTCPSession` object which can be used to process the
@@ -742,7 +773,7 @@ class SSHServer:
            If blocking operations need to be performed before the session
            can be created, a coroutine which returns an
            :class:`SSHTCPSession` object can be returned instead of
-           the session iself. This can be either returned directly or as
+           the session itself. This can be either returned directly or as
            a part of a tuple with an :class:`SSHTCPChannel` object.
 
            By default, all connection requests are rejected.
@@ -782,7 +813,7 @@ class SSHServer:
         return False # pragma: no cover
 
     def server_requested(self, listen_host: str,
-                         listen_port: int) -> MaybeAwait[_NewListener]:
+                         listen_port: int) -> MaybeAwait[_NewTCPListener]:
         """Handle a request to listen on a TCP/IP address and port
 
            This method is called when a client makes a request to
@@ -844,6 +875,11 @@ class SSHServer:
            :exc:`ChannelOpenError` exception with the reason for
            the failure.
 
+           If the application wishes to tunnel the connection over
+           another SSH connection, this method should return an
+           :class:`SSHClientConnection` connected to the desired
+           tunnel host.
+
            If the application wishes to process the data on the
            connection itself, this method should return either an
            :class:`SSHUNIXSession` object which can be used to process the
@@ -857,7 +893,7 @@ class SSHServer:
            If blocking operations need to be performed before the session
            can be created, a coroutine which returns an
            :class:`SSHUNIXSession` object can be returned instead of
-           the session iself. This can be either returned directly or as
+           the session itself. This can be either returned directly or as
            a part of a tuple with an :class:`SSHUNIXChannel` object.
 
            By default, all connection requests are rejected.
@@ -888,7 +924,7 @@ class SSHServer:
         return False # pragma: no cover
 
     def unix_server_requested(self, listen_path: str) -> \
-            MaybeAwait[_NewListener]:
+            MaybeAwait[_NewUNIXListener]:
         """Handle a request to listen on a UNIX domain socket
 
            This method is called when a client makes a request to
@@ -926,6 +962,132 @@ class SSHServer:
                        if the listener can't be opened
                      * `True` to set up standard path forwarding
                      * `False` to reject the request
+
+        """
+
+        return False # pragma: no cover
+
+    def tun_requested(self, unit: Optional[int]) -> _NewTunTapSession:
+        """Handle a layer 3 tunnel request
+
+           This method is called when a layer 3 tunnel request is received
+           by the server. Applications wishing to accept such tunnels must
+           override this method.
+
+           To allow standard forwarding of data on the connection to the
+           requested TUN device, this method should return `True`.
+
+           To reject this request, this method should return `False`
+           to send back a "Connection refused" response or raise an
+           :exc:`ChannelOpenError` exception with the reason for
+           the failure.
+
+           If the application wishes to tunnel the data over another
+           SSH connection, this method should return an
+           :class:`SSHClientConnection` connected to the desired
+           tunnel host.
+
+           If the application wishes to process the data on the
+           connection itself, this method should return either an
+           :class:`SSHTunTapSession` object which can be used to process the
+           data received on the channel or a tuple consisting of of an
+           :class:`SSHTunTapChannel` object created with
+           :meth:`create_tuntap_channel()
+           <SSHServerConnection.create_tuntap_channel>` and an
+           :class:`SSHTunTapSession`, if the application wishes
+           to pass non-default arguments when creating the channel.
+
+           If blocking operations need to be performed before the session
+           can be created, a coroutine which returns an
+           :class:`SSHTunTapSession` object can be returned instead of
+           the session itself. This can be either returned directly or as
+           a part of a tuple with an :class:`SSHTunTapChannel` object.
+
+           By default, all layer 3 tunnel requests are rejected.
+
+           :param dest_path:
+               The path the client wishes to connect to
+           :type dest_path: `str`
+
+           :returns: One of the following:
+
+                     * An :class:`SSHTunTapSession` object or a coroutine
+                       which returns an :class:`SSHTunTapSession`
+                     * A tuple consisting of an :class:`SSHTunTapChannel`
+                       and the above
+                     * A `callable` or coroutine handler function which
+                       takes AsyncSSH stream objects for reading from
+                       and writing to the connection
+                     * A tuple consisting of an :class:`SSHTunTapChannel`
+                       and the above
+                     * `True` to request standard layer 3 tunnel forwarding
+                     * `False` to refuse the connection
+
+           :raises: :exc:`ChannelOpenError` if the connection shouldn't
+                    be accepted
+
+        """
+
+        return False # pragma: no cover
+
+    def tap_requested(self, unit: Optional[int]) -> _NewTunTapSession:
+        """Handle a layer 2 tunnel request
+
+           This method is called when a layer 2 tunnel request is received
+           by the server. Applications wishing to accept such tunnels must
+           override this method.
+
+           To allow standard forwarding of data on the connection to the
+           requested TAP device, this method should return `True`.
+
+           To reject this request, this method should return `False`
+           to send back a "Connection refused" response or raise an
+           :exc:`ChannelOpenError` exception with the reason for
+           the failure.
+
+           If the application wishes to tunnel the data over another
+           SSH connection, this method should return an
+           :class:`SSHClientConnection` connected to the desired
+           tunnel host.
+
+           If the application wishes to process the data on the
+           connection itself, this method should return either an
+           :class:`SSHTunTapSession` object which can be used to process the
+           data received on the channel or a tuple consisting of of an
+           :class:`SSHTunTapChannel` object created with
+           :meth:`create_tuntap_channel()
+           <SSHServerConnection.create_tuntap_channel>` and an
+           :class:`SSHTunTapSession`, if the application wishes
+           to pass non-default arguments when creating the channel.
+
+           If blocking operations need to be performed before the session
+           can be created, a coroutine which returns an
+           :class:`SSHTunTapSession` object can be returned instead of
+           the session itself. This can be either returned directly or as
+           a part of a tuple with an :class:`SSHTunTapChannel` object.
+
+           By default, all layer 2 tunnel requests are rejected.
+
+           :param dest_path:
+               The path the client wishes to connect to
+           :type dest_path: `str`
+
+           :returns: One of the following:
+
+                     * An :class:`SSHTunTapSession` object or a coroutine
+                       which returns an :class:`SSHTunTapSession`
+                     * A tuple consisting of an :class:`SSHTunTapChannel`
+                       and the above
+                     * A `callable` or coroutine handler function which
+                       takes AsyncSSH stream objects for reading from
+                       and writing to the connection
+                     * A tuple consisting of an :class:`SSHTunTapChannel`
+                       and the above
+                     * `True` to request standard layer 2 tunnel forwarding
+                     * `False` to refuse the connection
+
+           :raises: :exc:`ChannelOpenError` if the connection shouldn't
+                    be accepted
 
         """
 

@@ -3,8 +3,617 @@
 Change Log
 ==========
 
+Release 2.21.1 (28 Sep 2025)
+----------------------------
+
+* Added the capability to defer invoking passphrase callback until
+  an encrypted private key is actually used in a signing operation,
+  rather than triggering the callback when keys are loaded. This
+  will only work when a public key is provided with an encrypted
+  private key either explicitly or as part of the key format (such
+  as in OpenSSH's private key format).
+
+* Improved handling of KeyboardInterrupt and task cancellation in
+  SCP. Thanks go to Viktor Kertesz for reporting this issue and
+  helping to understand the behavior in various versions of Python.
+
+* Fixed the env option to support mappings other than dict. Thanks
+  go to Boris Pavlovic for reporting this issue.
+
+* Fixed a potential race condition in SSHForwarder cleanup. Thanks
+  go to GitHub user misa-hase for reporting this issue and helping
+  to test the fix.
+
+Release 2.21.0 (2 May 2025)
+---------------------------
+
+* Added sparse file support for SFTP, allowing file copying which
+  automatically skips over any "holes" in a source file, transferring
+  only the data ranges which are actually present.
+
+* Added support for applications to request that session, connection,
+  or TUN/TAP requests arriving on an SSHServerConnection be forwarded
+  out some other established SSHClientConnection. Callback methods on
+  SSHServer which decide how to handle these requests can now return
+  an SSHClientConnection to set up this tunneling, instead of having
+  to accept the request and implement their own forwarding logic.
+
+* Further hardened the SSH key exchange process to make AsyncSSH
+  more strict when accepting messages during key exchange. Thanks
+  go to Fabian Bäumer and Marcus Brinkmann for identifying potential
+  issues here.
+
+* Added support for the auth_completed callback in SSHServer to
+  be either a callable or a coroutine, allowing async operations
+  to be performed when user authentication completes successfully,
+  prior to accepting session requests.
+
+* Added support for the sftp_factory config argument be either a
+  callable or a coroutine, allowing async operations to be performed
+  when starting up a new SFTP server session.
+
+* Fixed a bug where the exit() method of SFTPServer didn't handle
+  being declared as a coroutine. Thanks go to C. R. Oldham for
+  reporting this issue.
+
+* Improved handling of exceptions in connection_lost() callbacks.
+  Exceptions in connection_lost() will now be reported in the
+  debug log, but other cleanup code in AsyncSSH will continue,
+  ignoring those exceptions. Thanks go to Danil Slinchuk for
+  reporting this issue.
+
+Release 2.20.0 (17 Feb 2025)
+----------------------------
+
+* Added support for specifying an explicit path when configuring
+  agent forwarding. Thanks go to Aleksandr Ilin for pointing out
+  that this options supports more than just a boolean value.
+
+* Added support for environment variable expansion in SSH config,
+  for options which support percent expansion.
+
+* Added a new begin_auth callback in SSHClient, reporting the
+  username being sent during SSH client authentication. This can be
+  useful when the user is conditionally set via an SSH config file.
+
+* Improved strict-kex interoperability during re-keying. Thanks go
+  to GitHub user emeryalden for reporting this issue and helping
+  to track down the source of the problem.
+
+* Updated SFTP max_requests default to reduce memory usage when
+  using large block sizes.
+
+* Updated testing to add Python 3.13 and drop Python 3.7, avoiding
+  deprecation warnings from the cryptography package.
+
+* Fixed unit test issues under Windows, allowing unit tests to run
+  on Windows on all supported versions of Python.
+
+* Fixed a couple of issues with Python 3.14. Thanks go to Georg
+  Sauthoff for initially reporting this.
+
+Release 2.19.0 (12 Dec 2024)
+----------------------------
+
+* Added support for WebAuthN authentication with U2F security keys,
+  allowing non-admin Windows users to use these keys for authentication.
+  Previously, authentication with U2F keys worked on Windows, but only
+  for admin users.
+
+* Added support for hostname canonicalization, compatible with the
+  configuration parameters used in OpenSSH, as well as support for the
+  "canonical" and "final" match keywords and negation support for
+  match. Thanks go to GitHub user commonism who suggested this and
+  provided a proposed implementation for negation.
+
+* Added client and server support for SFTP copy-data extension and
+  a new SFTP remote_copy() function which allows data to be moved
+  between two remote files without downloading and re-uploading the
+  data. Thanks go to Ali Khosravi for suggesting this addition.
+
+* Moved project metadata from setup.py to pyproject.toml. Thanks go to
+  Marc Mueller for contributing this.
+
+* Updated SSH connection to keep strong references to outstanding
+  tasks, to avoid potential issues with the garbage collector while
+  the connection is active. Thanks go to GitHub user Birnendampf for
+  pointing out this potential issue and suggesting a simple fix.
+
+* Fixed some issues with block_size argument in SFTP copy functions.
+  Thanks go to Krzysztof Kotlenga for finding and reporting these issues.
+
+* Fixed an import error when fido2 package wasn't available. Thanks go
+  to GitHub user commonism for reporting this issue.
+
+Release 2.18.0 (26 Oct 2024)
+----------------------------
+
+* Added support for post-quantum ML-KEM key exchange algorithms,
+  interoperable with OpenSSH 9.9.
+
+* Added support for the OpenSSH "limits" extension, allowing the
+  client to query server limits such as the maximum supported read
+  and write sizes. The client will automatically default to the reported
+  maximum size on servers that support this extension.
+
+* Added more ways to specify environment variables via the `env` option.
+  Sequences of either 'key=value' strings or (key, value) tuples are now
+  supported, in addition to a dict.
+
+* Added support for getting/setting environment variables as byte strings
+  on platforms which support it. Previously, only Unicode strings were
+  accepted and they were always encoded on the wire using UTF-8.
+
+* Added support for non-TCP sockets (such as a socketpair) as the `sock`
+  parameter in connect calls. Thanks go to Christian Wendt for reporting
+  this problem and proposing a fix.
+
+* Changed compression to be disabled by default to avoid it becoming a
+  performance bottleneck on high-bandwidth connections. This now also
+  matches the OpenSSH default.
+
+* Improved speed of parallelized SFTP reads when read-ahead goes beyond
+  the end of the file. Thanks go to Maximilian Knespel for reporting
+  this issue and providing performance measurements on the code before
+  and after the change.
+
+* Improved cancellation handling during SCP transfers.
+
+* Improved support for selecting the currently available security key
+  when the application lists multiple keys to try. Thanks go to GitHub
+  user zanda8893 for reporting the issue and helping to work out the
+  details of the problem.
+
+* Improved handling of reverse DNS failures in host-based authentication.
+  Thanks go to GitHub user xBiggs for suggesting this change.
+
+* Improved debug logging of byte strings with non-printable characters.
+
+* Switched to using an executor on GSSAPI calls to avoid blocking the
+  event loop.
+
+* Fixed handling of "UserKnownHostsFile none" in config files. This
+  previously caused it to use the default known hosts, rather than
+  disabling known host checking.
+
+* Fixed a runtime warning about not awaiting a coroutine in unit tests.
+
+* Fixed a unit test failure on Windows when calling abort on a transport.
+
+* Fixed a problem where a "MAC verification failed" error was sometimes
+  sent on connection close.
+
+* Fixed SSHClientProcess code to not raise a runtime exception when
+  waiting more than once for a process to finish. Thanks go to GitHub
+  user starflows for reporting this issue.
+
+* Handled an error when attempting to import older verions of pyOpenSSL.
+  Thanks go to Maximilian Knespel for reporting this issue and testing
+  the fix.
+
+* Updated simple_server example code to switch from crypt to bcrypt,
+  since crypt has been removed in Python 3.13. Thanks go to Colin
+  Watson for providing this update.
+
+Release 2.17.0 (2 Sep 2024)
+---------------------------
+
+* Added support for specifying a per-connection credential store for GSSAPI
+  authentication. Thanks go to GitHub user zarganum for suggesting this
+  feature and proposing a detailed design.
+
+* Fixed a regression introduced in AsyncSSH 2.15.0 which could cause
+  connections to be closed with an uncaught exception when a session
+  on the connection was closed. Thanks go to Wilson Conley for being
+  the first to help reproduce this issue, and others who also helped
+  to confirm the fix.
+
+* Added a workaround where getaddrinfo() on some systems may return duplicate
+  entries, causing bind() to fail when opening a listener. Thanks go to
+  Colin Watson for reporting this issue and suggesting a fix.
+
+* Relaxed padding length check on OpenSSH private keys to provide better
+  compatibility with keys generated by PuTTYgen.
+
+* Improved documentation on SSHClient and SSHServer classes to explain
+  when they are created and their relationship to the SSHClientConnection
+  and SSHServerConnection classes.
+
+* Updated examples to use Python 3.7 and made some minor improvements.
+
+Release 2.16.0 (17 Aug 2024)
+----------------------------
+
+* Added client and server support for the OpenSSH "hostkeys" extension.
+  When using known_hosts, clients can provide a handler which will be
+  called with the changes between the keys currently trusted in the
+  client's known hosts and those available on the server. On the server
+  side, an application can choose whether or not to enable the sending
+  of this host key information. Thanks go to Matthijs Kooijman for
+  getting me to take another look at how this might be supported.
+
+* Related to the above, AsyncSSH now allows the configuration of multiple
+  server host keys of the same type when the send_server_host_keys option
+  is enabled. Only the first key of each type will be used in the SSH
+  handshake, but the others can appear in the list of supported host keys
+  for clients to begin trusting, allowing for smoother key rotation.
+
+* Fixed logging and typing issues in SFTP high-level copy functions.
+  A mix of bytes, str, and PurePath entries are now supported in places
+  where a list of file paths is allowed, and the type signatures have
+  been updated to reflect that the functions accept either a single
+  path or a list of paths. Thanks go to GitHub user eyalgolan1337 for
+  reporting these issues.
+
+* Improved typing on SFTP listdir() function. Thanks go to Tim Stumbaugh
+  for contributing this change.
+
+* Reworked the config file parser to improve on a previous fix related
+  to handling key/value pairs with an equals delimiter.
+
+* Improved handling of ciphers deprecated in cryptography 43.0.0.
+  Thanks go to Guillaume Mulocher for reporting this issue.
+
+* Improved support for use of Windows pathnames in ProxyCommand.
+  Thanks go to GitHub user chipolux for reporting this issue and
+  investigating the existing OpenSSH parsing behavior.
+
+Release 2.15.0 (3 Jul 2024)
+---------------------------
+
+* Added experimental support for tunneling of TUN/TAP network interfaces
+  on Linux and macOS, allowing for either automatic packet forwarding or
+  explicit reading and writing of packets sent through the tunnel by the
+  application. Both callback and stream APIs are available.
+
+* Added support for forwarding terminal size and terminal size changes
+  when stdin on an SSHServerProcess is redirected to a local TTY.
+
+* Added support for multiple tunnel/ProxyJump hosts. Thanks go to Adam
+  Martin for suggesting this enhancement and proposing a solution.
+
+* Added support for OpenSSH lsetstat SFTP extension to set attributes
+  on symbolic links on platforms which support that and use it to
+  improve symlink handling in the SFTP get, put, and copy methods.
+  In addition, a follow_symlinks option has been added on various
+  SFTPClient methods which get and set these attributes. Thanks go to
+  GitHub user eyalgolan1337 for reporting this issue.
+
+* Added support for password and passphrase arguments to be a callable
+  or awaitable, called when performing authentication or loading
+  encrypted private keys. Thanks go to GitHub user goblin for
+  suggesting this enhancement.
+
+* Added support for proper flow control when using AsyncFileWriter or
+  StreamWriter classes to do SSH process redirection. Thanks go to Benjy
+  Wiener for reporting this issue and providing feedback on the fix.
+
+* Added is_closed() method SSHClientConnection/SSHServerConnection to
+  return whether the associated network connection is closed or not.
+
+* Added support for setting and matching tags in OpenSSH config files.
+
+* Added an example of using "await" in addition to "async with" when
+  opening a new SSHClientConnection. Thanks go to Michael Davis for
+  suggesting this added documentation.
+
+* Improved handling CancelledError in SCP, avoiding an issue where
+  AsyncSSH could sometimes get stuck waiting for the channel to close.
+  Thanks go to Max Orlov for reporting the problem and providing code
+  to reproduce it.
+
+* Fixed a regression from 2.14.1 related to rekeying an SSH connection
+  when there's acitivty on the connection in the middle of rekeying.
+  Thanks go to GitHub user eyalgolan1337 for helping to narrow down
+  this problem and test the fix.
+
+* Fixed a problem with process redirection when a close is received
+  without a preceding EOF. Thanks go to GitHub user xuoguoto who helped
+  to provide sample scripts and ran tests to help track this down.
+
+* Fixed the processing of paths in SFTP client symlink requests. Thanks
+  go to André Glüpker for reporting the problem and providing test code
+  to demonstrate it.
+
+* Fixed an OpenSSH config file parsing issue. Thanks go to Siddh Raman
+  Pant for reporting this issue.
+
+* Worked around a bug in a user auth banner generated by the cryptlib
+  library. Thanks go to GitHub user mmayomoar for reporting this issue
+  and suggesting a fix.
+
+Release 2.14.2 (18 Dec 2023)
+----------------------------
+
+* Implemented "strict kex" support and other countermeasures to
+  protect against the Terrapin Attack described in `CVE-2023-48795
+  <https://github.com/advisories/GHSA-hfmc-7525-mj55>`_. Thanks once
+  again go to Fabian Bäumer, Marcus Brinkmann, and Jörg Schwenk for
+  identifying and reporting this vulnerability and providing detailed
+  analysis and suggestions about proposed fixes.
+
+* Fixed config parser to properly an optional equals delimiter in all
+  config arguments. Thanks go to Fawaz Orabi for reporting this issue.
+
+* Fixed TCP send error handling to avoid race condition when receiving
+  incoming disconnect message.
+
+* Improved type signature in SSHConnection async context manager. Thanks
+  go to Pieter-Jan Briers for providing this.
+
+Release 2.14.1 (8 Nov 2023)
+---------------------------
+
+* Hardened AsyncSSH state machine against potential message
+  injection attacks, described in more detail in `CVE-2023-46445
+  <https://github.com/advisories/GHSA-cfc2-wr2v-gxm5>`_ and `CVE-2023-46446
+  <https://github.com/advisories/GHSA-c35q-ffpf-5qpm>`_. Thanks go to
+  Fabian Bäumer, Marcus Brinkmann, and Jörg Schwenk for identifying
+  and reporting these vulnerabilities and providing detailed analysis
+  and suggestions about the proposed fixes.
+
+* Added support for passing in a regex in readuntil in SSHReader,
+  contributed by Oded Engel.
+
+* Added support for get_addresses() and get_port() methods on
+  SSHAcceptor. Thanks go to Allison Karlitskaya for suggesting
+  this feature.
+
+* Fixed an issue with AsyncFileWriter potentially writing data
+  out of order. Thanks go to Chan Chun Wai for reporting this
+  issue and providing code to reproduce it.
+
+* Updated testing to include Python 3.12.
+
+* Updated readthedocs integration to use YAML config file.
+
+Release 2.14.0 (30 Sep 2023)
+----------------------------
+
+* Added support for a new accept_handler argument when setting up
+  local port forwarding, allowing the client host and port to be
+  validated and/or logged for each new forwarded connection. An
+  accept handler can also be returned from the server_requested
+  function to provide this functionality when acting as a server.
+  Thanks go to GitHub user zgxkbtl for suggesting this feature.
+
+* Added an option to disable expensive RSA private key checks when
+  using OpenSSL 3.x. Functions that read private keys have been
+  modified to include a new unsafe_skip_rsa_key_validation argument
+  which can be used to avoid these additional checks, if you are
+  loading keys from a trusted source.
+
+* Added host information into AsyncSSH exceptions when host key
+  validation fails, and a few other improvements related to X.509
+  certificate validation errors. Thanks go to Peter Moore for
+  suggesting this and providing an example.
+
+* Fixed a regression which prevented keys loaded into an SSH agent
+  with a certificate from working correctly beginning in AsyncSSH
+  after version 2.5.0. Thanks go to GitHub user htol for reporting
+  this issue and suggesting the commit which caused the problem.
+
+* Fixed an issue which was triggering an internal exception when
+  shutting down server sessions with the line editor enabled which
+  could cause some output to be lost on exit, especially when running
+  on Windows. Thanks go to GitHub user jerrbe for reporting this issue.
+
+* Fixed an issue in a unit test seen in Python 3.12 beta. Thanks go
+  to Georg Sauthoff for providing this fix.
+
+* Fixed a documentation error in SSHClientConnectionOptions and
+  SSHServerConnectionOptions. Thanks go to GitHub user bowenerchen
+  for reporting this issue.
+
+Release 2.13.2 (21 Jun 2023)
+----------------------------
+
+* Fixed an issue with host-based authentication when using proxy_command,
+  allowing it to be used if the caller explicitly specifies client_host.
+  Thanks go to GitHub user yuqingm7 for reporting this issue.
+
+* Improved handling of signature algorithms for OpenSSH certificates
+  so that RSA SHA-2 signatures will work with both older and newer
+  versions of OpenSSH.
+
+* Worked around an issue with some Cisco SSH implementations generating
+  invalid "ignore" packets. Thanks go to Jost Luebbe for reporting and
+  helping to debug this issue.
+
+* Fixed unit tests to avoid errors when cryptography's version of
+  OpenSSL disables support for SHA-1 signatures.
+
+* Fixed unit tests to avoid errors when the filesystem enforces that
+  filenames be valid UTF-8 strings. Thanks go to Robert Schütz and
+  Martin Weinelt for reporting this issue.
+
+* Added documentation about which config options apply when passing
+  a string as a tunnel argument.
+
+Release 2.13.1 (18 Feb 2023)
+----------------------------
+
+* Updated type definitions for mypy 1.0.0, removing a dependency on
+  implicit Optional types, and working around an issue that could
+  trigger a mypy internal error.
+
+* Updated unit tests to avoid calculation of SHA-1 signatures, which
+  are no longer allowed in cryptography 39.0.0.
+
+Release 2.13.0 (27 Dec 2022)
+----------------------------
+
+* Updated testing and coverage to drop Python 3.6 and add Python 3.11.
+  Thanks go to GitHub user hexchain for maintaining the GitHub workflows
+  supporting this!
+
+* Added new "recv_eof" option to not pass an EOF from a channel to a
+  redirected target, allowing output from multiple SSH sessions to be
+  sent and mixed with other direct output to that target. This is meant
+  to be similar to the existing "send_eof" option which controls whether
+  EOF on a redirect source is passed through to the SSH channel. Thanks
+  go to Stuart Reynolds for inspiring this idea.
+
+* Added new methods to make it easy to perform forwarding between TCP
+  ports and UNIX domain sockets. Thanks go to Alex Rogozhnikov for
+  suggesting this use case.
+
+* Added a workaround for a problem seen on a Huawei SFTP server where
+  it sends an invalid combination of file attribute flags. In cases where
+  the flags are otherwise valid and the right amount of attribute data is
+  available, AsyncSSH will ignore the invalid flags and proceed.
+
+* Fixed an issue with copying files to SFTP servers that don't support
+  random access I/O. The potential to trigger this failyre goes back
+  several releases, but a change in AsyncSSH 2.12 made out-of-order writes
+  much more likely. This fix returns AsyncSSH to its previous behavior
+  where out-of-order writes are unlikely even when taking advantage of
+  parallel reads. Thanks go to Patrik Lindgren and Stefan Walkner for
+  reporting this issue and helping to identify the source of the problem.
+
+* Fixed an issue when requesting remote port forwarding on a dynamically
+  allocated port. Thanks go to Daniel Shimon for reporting this and
+  proposing a fix.
+
+* Fixed an issue where readexactly could block indefinitely when a signal
+  is delivered in the stream before the requested number of bytes are
+  available. Thanks go to Artem Bezborodko for reporting this and
+  providing a fix.
+
+* Fixed an interoperability issue with OpenSSH when using SSH certificates
+  with RSA keys with a SHA-2 signature. Thanks go to Łukasz Siudut for
+  reporting this.
+
+* Fixed an issue with handling "None" in ProxyCommand, GlobalKnownHostsFile,
+  and UserKnownHostsFile config file options. Thanks go to GitHub user
+  dtrifiro for reporting this issue and suggesting a fix.
+
+Release 2.12.0 (10 Aug 2022)
+----------------------------
+
+* Added top-level functions run_client() and run_server() which allow
+  you to begin running an SSH client or server on an already-connected
+  socket. This capability is also available via a new "sock" argument
+  in the existing connect(), connect_reverse(), get_server_host_key(),
+  and get_server_auth_methods() functions.
+
+* Added "sock" argument to listen() and listen_reverse() functions
+  which takes an already-bound listening socket instead of a host
+  and port to bind a new socket to.
+
+* Added support for forwarding break, signal, and terminal size updates
+  when redirection of stdin is set up between two SSHProcess instances.
+
+* Added support for sntrup761x25519-sha512@openssh.com post-quantum
+  key exchange algorithm. For this to be available, the Open Quantum
+  Safe (liboqs) dynamic library must be installed.
+
+* Added "sig_alg" argument to set a signature algorithm when creating
+  OpenSSH certificates, allowing a choice between ssh-rsa, rsa-sha2-256,
+  and rsa-sha2-512 for certificates signed by RSA keys.
+
+* Added new read_parallel() method in SFTPClientFile which allows
+  parallel reads to be performed from a remote file, delivering
+  incremental results as these reads complete. Previously, large
+  reads would automatically be parallelized, but a result was only
+  returned after all reads completed.
+
+* Added definition of __all__ for public symbols in AsyncSSH to make
+  pyright autocompletion work better. Thanks go to Nicolas Riebesel
+  for providing this change.
+
+* Updated SFTP and SCP glob and copy functions to use scandir() instead
+  of listdir() to improve efficiency.
+
+* Updated default for "ignore_encrypted" client connection option to
+  ignore encrypted keys specified in an OpenSSH config file when no
+  passphrase is provided, similar to what was previously done for
+  keys with default names.
+
+* Fixed an issue when using an SSH agent with RSA keys and an X.509
+  certificate while requesting SHA-2 signatures.
+
+* Fixed an issue with use of expanduser() in unit tests on newer versions
+  of Python. Thanks go to Georg Sauthoff for providing an initial version
+  of this fix.
+
+* Fixed an issue with fallback to a Pageant agent not working properly
+  on Windows when no agent_path or SSH_AUTH_SOCK was set.
+
+* Fixed improper escaping in readuntil(), causing certain punctuation in
+  separator to not match properly. Thanks go to Github user MazokuMaxy
+  for reporting this issue.
+
+* Fixed the connection close handler to properly mark channels as fully
+  closed when the peer unexpected closes the connection, allowing
+  exceptions to fire if an application continues to try and use
+  the channel. Thanks go to Taha Jahangir for reporting this issue and
+  suggesting a possible fix.
+
+* Eliminated unit testing against OpenSSH for tests involving DSA and
+  RSA keys using SHA-1 signatures, since this support is being dropped
+  in some distributions of OpenSSH. These tests are still performed, but
+  using only AsyncSSH code. Thanks go to Ken Dreyer and Georg Sauthoff
+  for reporting this issue and helping me to reproduce it.
+
+Release 2.11.0 (4 Jun 2022)
+---------------------------
+
+* Made a number of improvements in SFTP glob support, with thanks to
+  Github user LuckyDams for all the help working out these changes!
+
+  * Added a new glob_sftpname() method which returns glob matches
+    together with attribute information, avoiding the need for a
+    caller to make separate calls to stat() on the returned results.
+  * Switched from listdir() to scandir() to reduce the number of
+    stat() operations required while finding matches.
+  * Added code to remove duplicates when glob() is called with
+    multiple patterns that match the same path.
+  * Added a cache of directory listing and stat results to improve
+    performance when matching patterns with overlapping paths.
+  * Fixed an "index out of range" bug in recursive glob matching
+    and aligned it better with results reeturned by UNIX shells.
+  * Changed matching to ignore inaccessible or non-existent paths
+    in a glob pattern, to allow accessible paths to be fully
+    explored before returning an error. The error handler will now
+    be called only if a pattern results in no matches, or if a more
+    serious error occurs while scanning.
+
+* Changed SFTP makedirs() method to work better in cases where parts of
+  requested path already exist but don't allow read access. As long as
+  the entire path can be created, makedirs() will succeed, even if some
+  directories on the path don't allow their contents to be read. Thanks
+  go to Peter Rowlands for providing this fix.
+
+* Replaced custom Diffie Hellman implementation in AsyncSSH with the
+  one in the cryptography package, resulting in an over 10x speedup.
+  Thanks go to Github user iwanb for suggesting this change.
+
+* Fixed AsyncSSH to re-acquire GSS credentials when performing key
+  renegotiation to avoid expired credentials on long-lived connections.
+  Thanks go to Github user PromyLOPh for pointing out this issue and
+  suggesting a fix.
+
+* Fixed GSS MIC to work properly with GSS key exchange when AsyncSSH
+  is running as a server. This was previously fixed on the client side,
+  but a similar fix for the server was missed.
+
+* Changed connection timeout unit tests to work better in environments
+  where a firewall is present. Thanks go to Stefano Rivera for
+  reporting this issue.
+
+* Improved unit tests of Windows SSPI GSSAPI module.
+
+* Improved speed of unit tests by reducing the number of key generation
+  calls. RSA key generation in particular has gotten much more expensive
+  in OpenSSL 3.
+
 Release 2.10.1 (16 Apr 2022)
 ----------------------------
+
+* Added a workaround for a bug in dropbear which can improperly reject
+  full-sized data packets when compression is enabled. Thanks go to
+  Matti Niemenmaa for reporting this issue and helping to reproduce it.
 
 * Added support for "Match Exec" in config files and updated AsyncSSH
   API calls to do config parsing in an executor to avoid blocking the
@@ -20,7 +629,7 @@ Release 2.10.1 (16 Apr 2022)
   trigger a debug message rather than an error. Thanks go to Caleb Ho
   for reporting this issue!
 
-* Update minimum required version of cryprography package to 3.1, to
+* Updated minimum required version of cryprography package to 3.1, to
   allow calls to it to be made without passing in a "backend" argument.
   This was missed back in the 2.9 release. Thanks go to Github users
   sebby97 and JavaScriptDude for reporting this issue!
@@ -161,7 +770,7 @@ Release 2.7.1 (6 Sep 2021)
 * Fixed a couple of issues related to sending SSH_EXT_INFO messages.
 
 * Fixed an issue with using SSHAcceptor as an async context manager.
-  Thanks go to Paulo Costa for reporing this.
+  Thanks go to Paulo Costa for reporting this.
 
 * Fixed an issue where a tunnel wasn't always cleaned up properly when
   creating a remote listener.
@@ -281,7 +890,7 @@ Release 2.6.0 (1 May 2021)
   0.8.1.
 
 * Fixed problem with setting config options with percent substitutions
-  to 'none'. Percent subsitution should not be performed in this case.
+  to 'none'. Percent substitution should not be performed in this case.
   Thanks go to Yuqing Miao for finding and reporting this issue!
 
 * Fixed return type of filenames in SFTPClient scandir() and readlink()
@@ -774,7 +1383,7 @@ Release 1.16.1 (30 Mar 2019)
 * Added channel, connection, and env properties to SFTPServer instances,
   so connection and channel information can be used to influence the
   SFTP server's behavior. Previously, connection information was made
-  avaiable through the constructor, but channel and environment
+  available through the constructor, but channel and environment
   information was not. Now, all of these are available as properties
   on the SFTPServer instance without the need to explicitly store anything
   in a custom constructor.
@@ -1137,7 +1746,7 @@ Release 1.12.0 (5 Feb 2018)
 
 * Updated key and certificate comment handling to be less sensitive to
   the encoding of non-ASCII characters. The get_comment() and set_comment()
-  functions now take an optional encoding paramter, defaulting to UTF-8
+  functions now take an optional encoding parameter, defaulting to UTF-8
   but allowing for others encodings. There's also a get_comment_bytes()
   function to get the comment data as bytes without performing Unicode
   decoding.
@@ -1386,7 +1995,7 @@ Release 1.7.0 (7 Oct 2016)
   these signature algorithms.
 
 * Added new load_keypairs and load_public_keys API functions which
-  support expicitly loading keys using the same syntax that was
+  support explicitly loading keys using the same syntax that was
   previously available for specifying client_keys, authorized_client_keys,
   and server_host_keys arguments when creating SSH clients and servers.
 

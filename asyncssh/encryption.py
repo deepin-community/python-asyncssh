@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -48,7 +48,7 @@ class Encryption:
 
     @classmethod
     def get_mac_params(cls, mac_alg: bytes) -> Tuple[int, int, bool]:
-        """Get paramaters of the MAC algorithm used with this encryption"""
+        """Get parameters of the MAC algorithm used with this encryption"""
 
         return get_mac_params(mac_alg)
 
@@ -163,7 +163,7 @@ class GCMEncryption(Encryption):
 
     @classmethod
     def get_mac_params(cls, mac_alg: bytes) -> Tuple[int, int, bool]:
-        """Get paramaters of the MAC algorithm used with this encryption"""
+        """Get parameters of the MAC algorithm used with this encryption"""
 
         return 0, 16, True
 
@@ -202,7 +202,7 @@ class ChachaEncryption(Encryption):
 
     @classmethod
     def get_mac_params(cls, mac_alg: bytes) -> Tuple[int, int, bool]:
-        """Get paramaters of the MAC algorithm used with this encryption"""
+        """Get parameters of the MAC algorithm used with this encryption"""
 
         return 0, 16, True
 

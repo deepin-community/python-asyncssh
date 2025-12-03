@@ -26,7 +26,7 @@ import asyncssh
 
 from .server import ServerTestCase
 from .sk_stub import sk_available, stub_sk, unstub_sk, patch_sk, sk_error
-from .util import asynctest
+from .util import asynctest, get_test_key
 
 
 class _CheckSKAuth(ServerTestCase):
@@ -37,6 +37,7 @@ class _CheckSKAuth(ServerTestCase):
     _sk_resident = False
     _sk_touch_required = True
     _sk_auth_touch_required = True
+    _sk_use_webauthn = False
     _sk_cert = False
     _sk_host = False
 
@@ -44,10 +45,11 @@ class _CheckSKAuth(ServerTestCase):
     async def start_server(cls):
         """Start an SSH server which supports security key authentication"""
 
-        cls.addClassCleanup(unstub_sk, *stub_sk(cls._sk_devs))
+        cls.addClassCleanup(unstub_sk, *stub_sk(cls._sk_devs,
+                                                cls._sk_use_webauthn))
 
-        cls._privkey = asyncssh.generate_private_key(
-            cls._sk_alg, resident=cls._sk_resident,
+        cls._privkey = get_test_key(
+            cls._sk_alg, cls._sk_use_webauthn, resident=cls._sk_resident,
             touch_required=cls._sk_touch_required)
 
         if cls._sk_host:
@@ -123,8 +125,9 @@ class _TestSKAuthCTAP1(_CheckSKAuth):
         """Test security key returning a CTAP 1 error"""
 
         with sk_error('err'):
-            with self.assertRaises(ValueError):
-                await self.connect(username='ckey', client_keys=[self._privkey])
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self.connect(username='ckey',
+                                   client_keys=[self._privkey])
 
 
 @unittest.skipUnless(sk_available, 'security key support not available')
@@ -144,7 +147,7 @@ class _TestSKAuthCTAP2(_CheckSKAuth):
     async def test_enroll_without_pin(self):
         """Test generating key without a PIN"""
 
-        key = asyncssh.generate_private_key('sk-ssh-ed25519@openssh.com')
+        key = get_test_key('sk-ssh-ed25519@openssh.com')
 
         self.assertIsNotNone(key)
 
@@ -152,8 +155,7 @@ class _TestSKAuthCTAP2(_CheckSKAuth):
     async def test_enroll_with_pin(self):
         """Test generating key with a PIN"""
 
-        key = asyncssh.generate_private_key('sk-ssh-ed25519@openssh.com',
-                                            pin=b'123456')
+        key = get_test_key('sk-ssh-ed25519@openssh.com', pin=b'123456')
 
         self.assertIsNotNone(key)
 
@@ -170,8 +172,9 @@ class _TestSKAuthCTAP2(_CheckSKAuth):
         """Test security key returning a CTAP 2 error"""
 
         with sk_error('err'):
-            with self.assertRaises(ValueError):
-                await self.connect(username='ckey', client_keys=[self._privkey])
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self.connect(username='ckey',
+                                   client_keys=[self._privkey])
 
     @asynctest
     async def test_enroll_pin_invalid(self):
@@ -192,6 +195,20 @@ class _TestSKAuthCTAP2(_CheckSKAuth):
 
 
 @unittest.skipUnless(sk_available, 'security key support not available')
+class _TestSKAuthWebAuthN(_CheckSKAuth):
+    """Unit tests for security key authentication with WebAuthN"""
+
+    _sk_alg = 'sk-ecdsa-sha2-nistp256@openssh.com'
+    _sk_use_webauthn = True
+
+    @asynctest
+    async def test_auth(self):
+        """Test authenticating with the Windows WebAuthN API"""
+
+        async with self.connect(username='ckey', client_keys=[self._privkey]):
+            pass
+
+@unittest.skipUnless(sk_available, 'security key support not available')
 class _TestSKAuthMultipleKeys(_CheckSKAuth):
     """Unit tests for security key authentication with multiple keys"""
 
@@ -202,8 +219,9 @@ class _TestSKAuthMultipleKeys(_CheckSKAuth):
         """Test authenticating with security credential not found"""
 
         with sk_error('nocred'):
-            with self.assertRaises(ValueError):
-                await self.connect(username='ckey', client_keys=[self._privkey])
+            with self.assertRaises(asyncssh.PermissionDenied):
+                await self.connect(username='ckey',
+                                   client_keys=[self._privkey])
 
 
 @unittest.skipUnless(sk_available, 'security key support not available')
@@ -256,7 +274,7 @@ class _TestSKAuthResidentKeys(_CheckSKAuth):
         """Test getting resident keys returning a CTAP 2 error"""
 
         with sk_error('err'):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(asyncssh.KeyImportError):
                 asyncssh.load_resident_keys(b'123456')
 
     @asynctest

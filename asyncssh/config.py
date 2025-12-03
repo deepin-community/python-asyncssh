@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2020-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -41,6 +41,10 @@ from .pattern import HostPatternList, WildcardPatternList
 ConfigPaths = Union[None, FilePath, Sequence[FilePath]]
 
 
+_token_pattern = re.compile(r'%(.)')
+_env_pattern = re.compile(r'\${(.*)}')
+
+
 def _exec(cmd: str) -> bool:
     """Execute a command and return if exit status is 0"""
 
@@ -60,12 +64,15 @@ class SSHConfig:
     _percent_expand = {'AuthorizedKeysFile'}
     _handlers: Dict[str, Tuple[str, Callable]] = {}
 
-    def __init__(self, last_config: Optional['SSHConfig'], reload: bool):
+    def __init__(self, last_config: Optional['SSHConfig'], reload: bool,
+                 canonical: bool, final: bool):
         if last_config:
             self._last_options = last_config.get_options(reload)
         else:
             self._last_options = {}
 
+        self._canonical = canonical
+        self._final = True if final else None
         self._default_path = Path('~', '.ssh').expanduser()
         self._path = Path()
         self._line_no = 0
@@ -75,11 +82,10 @@ class SSHConfig:
 
         self.loaded = False
 
-    def _error(self, reason: str, *args: object) -> NoReturn:
+    def _error(self, reason: str) -> NoReturn:
         """Raise a configuration parsing error"""
 
-        raise ConfigParseError('%s line %s: %s' % (self._path, self._line_no,
-                                                   reason % args))
+        raise ConfigParseError(f'{self._path} line {self._line_no}: {reason}')
 
     def _match_val(self, match: str) -> object:
         """Return the value to match against in a match condition"""
@@ -91,36 +97,38 @@ class SSHConfig:
 
         raise NotImplementedError
 
+    def _expand_token(self, match):
+        """Expand a percent token reference"""
+
+        try:
+            token = match.group(1)
+            return self._tokens[token]
+        except KeyError:
+            if token == 'd':
+                raise ConfigParseError('Home directory is '
+                                       'not available') from None
+            elif token == 'i':
+                raise ConfigParseError('User id not available') from None
+            else:
+                raise ConfigParseError('Invalid token expansion: ' +
+                                       token) from None
+
+    @staticmethod
+    def _expand_env(match):
+        """Expand an environment variable reference"""
+
+        try:
+            var = match.group(1)
+            return os.environ[var]
+        except KeyError:
+            raise ConfigParseError('Invalid environment expansion: ' +
+                                   var) from None
+
     def _expand_val(self, value: str) -> str:
-        """Perform percent token expansion on a string"""
+        """Perform percent token and environment expansion on a string"""
 
-        last_idx = 0
-        result: List[str] = []
-
-        for match in re.finditer(r'%', value):
-            idx = match.start()
-
-            if idx < last_idx:
-                continue
-
-            try:
-                token = value[idx+1]
-                result.extend([value[last_idx:idx], self._tokens[token]])
-                last_idx = idx + 2
-            except IndexError:
-                raise ConfigParseError('Invalid token substitution') from None
-            except KeyError:
-                if token == 'd':
-                    raise ConfigParseError('Home directory is '
-                                           'not available') from None
-                elif token == 'i':
-                    raise ConfigParseError('User id not available') from None
-                else:
-                    raise ConfigParseError('Invalid token substitution: %s' %
-                                           value[idx+1]) from None
-
-        result.append(value[last_idx:])
-        return ''.join(result)
+        return _env_pattern.sub(self._expand_env,
+                                _token_pattern.sub(self._expand_token, value))
 
     def _include(self, option: str, args: List[str]) -> None:
         """Read config from a list of other config files"""
@@ -141,7 +149,7 @@ class SSHConfig:
             paths = list(path.glob(pattern))
 
             if not paths:
-                logger.debug1('Config pattern "%s" matched no files', pattern)
+                logger.debug1(f'Config pattern "{pattern}" matched no files')
 
             for path in paths:
                 self.parse(path)
@@ -154,35 +162,53 @@ class SSHConfig:
 
         # pylint: disable=unused-argument
 
+        matching = True
+
         while args:
             match = args.pop(0).lower()
 
+            if match[0] == '!':
+                match = match[1:]
+                negated = True
+            else:
+                negated = False
+
+            if match == 'final' and self._final is None:
+                self._final = False
+
             if match == 'all':
-                self._matching = True
-                continue
+                result = True
+            elif match == 'canonical':
+                result = self._canonical
+            elif match == 'final':
+                result = cast(bool, self._final)
+            else:
+                match_val = self._match_val(match)
 
-            match_val = self._match_val(match)
+                if match != 'exec' and match_val is None:
+                    self._error(f'Invalid match condition {match}')
 
-            if match != 'exec' and match_val is None:
-                self._error('Invalid match condition')
+                try:
+                    arg = args.pop(0)
+                except IndexError:
+                    self._error(f'Missing {match} match pattern')
 
-            try:
-                if match == 'exec':
-                    self._matching = _exec(args.pop(0))
-                elif match in ('address', 'localaddress'):
-                    host_pat = HostPatternList(args.pop(0))
-                    ip = ip_address(cast(str, match_val)) \
-                        if match_val else None
-                    self._matching = host_pat.matches(None, match_val, ip)
-                else:
-                    wild_pat = WildcardPatternList(args.pop(0))
-                    self._matching = wild_pat.matches(match_val)
-            except IndexError:
-                self._error('Missing %s match pattern', match)
+                if matching:
+                    if match == 'exec':
+                        result = _exec(arg)
+                    elif match in ('address', 'localaddress'):
+                        host_pat = HostPatternList(arg)
+                        ip = ip_address(cast(str, match_val)) \
+                            if match_val else None
+                        result = host_pat.matches(None, match_val, ip)
+                    else:
+                        wild_pat = WildcardPatternList(arg)
+                        result = wild_pat.matches(match_val)
 
-            if not self._matching:
-                args.clear()
-                break
+            if matching and result == negated:
+                matching = False
+
+        self._matching = matching
 
     def _set_bool(self, option: str, args: List[str]) -> None:
         """Set a boolean config option"""
@@ -194,7 +220,23 @@ class SSHConfig:
         elif value_str in ('no', 'false'):
             value = False
         else:
-            self._error('Invalid %s boolean value: %s', option, value_str)
+            self._error(f'Invalid {option} boolean value: {value_str}')
+
+        if option not in self._options:
+            self._options[option] = value
+
+    def _set_bool_or_str(self, option: str, args: List[str]) -> None:
+        """Set a boolean or string config option"""
+
+        value_str = args.pop(0)
+        value_lower = value_str.lower()
+
+        if value_lower in ('yes', 'true'):
+            value: Union[bool, str] = True
+        elif value_lower in ('no', 'false'):
+            value = False
+        else:
+            value = value_str
 
         if option not in self._options:
             self._options[option] = value
@@ -207,7 +249,7 @@ class SSHConfig:
         try:
             value = int(value_str)
         except ValueError:
-            self._error('Invalid %s integer value: %s', option, value_str)
+            self._error(f'Invalid {option} integer value: {value_str}')
 
         if option not in self._options:
             self._options[option] = value
@@ -243,7 +285,10 @@ class SSHConfig:
         """Set whitespace-separated string config options as a list"""
 
         if option not in self._options:
-            self._options[option] = args[:]
+            if len(args) == 1 and args[0].lower() == 'none':
+                self._options[option] = []
+            else:
+                self._options[option] = args[:]
 
         args.clear()
 
@@ -269,7 +314,24 @@ class SSHConfig:
         elif value_str == 'inet6':
             value = socket.AF_INET6
         else:
-            self._error('Invalid %s value: %s', option, value_str)
+            self._error(f'Invalid {option} value: {value_str}')
+
+        if option not in self._options:
+            self._options[option] = value
+
+    def _set_canonicalize_host(self, option: str, args: List[str]) -> None:
+        """Set a canonicalize host config option"""
+
+        value_str = args.pop(0).lower()
+
+        if value_str in ('yes', 'true'):
+            value: Union[bool, str] = True
+        elif value_str in ('no', 'false'):
+            value = False
+        elif value_str == 'always':
+            value = value_str
+        else:
+            self._error(f'Invalid {option} value: {value_str}')
 
         if option not in self._options:
             self._options[option] = value
@@ -293,6 +355,11 @@ class SSHConfig:
         if option not in self._options:
             self._options[option] = byte_limit, time_limit
 
+    def has_match_final(self) -> bool:
+        """Return whether this config includes a 'Match final' block"""
+
+        return self._final is not None
+
     def parse(self, path: Path) -> None:
         """Parse an OpenSSH config file and return matching declarations"""
 
@@ -312,23 +379,33 @@ class SSHConfig:
                     continue
 
                 try:
-                    args = shlex.split(line)
+                    split_args = shlex.split(line)
                 except ValueError as exc:
                     self._error(str(exc))
 
-                option = args.pop(0)
+                args = []
+                loption = ''
+                allow_equal = True
 
-                if option.endswith('='):
-                    option = option[:-1]
-                elif '=' in option:
-                    option, arg = option.split('=', 1)
-                    args[:0] =[arg]
-                elif args and args[0] == '=':
-                    del args[0]
-                elif args and args[0].startswith('='):
-                    args[0] = args[0][1:]
+                for i, arg in enumerate(split_args, 1):
+                    if arg.startswith('='):
+                        if len(arg) > 1:
+                            args.append(arg[1:])
+                    elif not allow_equal:
+                        args.extend(split_args[i-1:])
+                        break
+                    elif arg.endswith('='):
+                        args.append(arg[:-1])
+                    elif '=' in arg:
+                        arg, val = arg.split('=', 1)
+                        args.append(arg)
+                        args.append(val)
+                    else:
+                        args.append(arg)
 
-                loption = option.lower()
+                    if i == 1:
+                        loption = args.pop(0).lower()
+                        allow_equal = loption in self._conditionals
 
                 if loption in self._no_split:
                     args = [line.lstrip()[len(loption):].strip()]
@@ -342,12 +419,12 @@ class SSHConfig:
                     continue
 
                 if not args:
-                    self._error('Missing %s value', option)
+                    self._error(f'Missing {option} value')
 
                 handler(self, option, args)
 
                 if args:
-                    self._error('Extra data at end: %s', ' '.join(args))
+                    self._error(f'Extra data at end: {" ".join(args)}')
 
         self._set_tokens()
 
@@ -372,10 +449,10 @@ class SSHConfig:
     @classmethod
     def load(cls, last_config: Optional['SSHConfig'],
              config_paths: ConfigPaths, reload: bool,
-             *args: object) -> 'SSHConfig':
+             canonical: bool, final: bool, *args: object) -> 'SSHConfig':
         """Load a list of OpenSSH config files into a config object"""
 
-        config = cls(last_config, reload, *args)
+        config = cls(last_config, reload, canonical, final, *args)
 
         if config_paths:
             if isinstance(config_paths, (str, PurePath)):
@@ -412,13 +489,14 @@ class SSHClientConfig(SSHConfig):
     """Settings from an OpenSSH client config file"""
 
     _conditionals = {'host', 'match'}
-    _no_split = {'remotecommand'}
-    _percent_expand = {'CertificateFile', 'IdentityAgent',
+    _no_split = {'proxycommand', 'remotecommand'}
+    _percent_expand = {'CertificateFile', 'ForwardAgent', 'IdentityAgent',
                        'IdentityFile', 'ProxyCommand', 'RemoteCommand'}
 
     def __init__(self, last_config: 'SSHConfig', reload: bool,
-                 local_user: str, user: str, host: str, port: int) -> None:
-        super().__init__(last_config, reload)
+                 canonical: bool, final: bool, local_user: str,
+                 user: str, host: str, port: int) -> None:
+        super().__init__(last_config, reload, canonical, final)
 
         self._local_user = local_user
         self._orig_host = host
@@ -440,6 +518,8 @@ class SSHClientConfig(SSHConfig):
             return self._local_user
         elif match == 'user':
             return self._options.get('User', self._local_user)
+        elif match == 'tagged':
+            return self._options.get('Tag', '')
         else:
             return None
 
@@ -471,10 +551,10 @@ class SSHClientConfig(SSHConfig):
             value: Union[bool, str] = True
         elif value_str in ('no', 'false'):
             value = False
-        elif value_str not in ('force', 'auto'):
-            self._error('Invalid %s value: %s', option, value_str)
-        else:
+        elif value_str in ('force', 'auto'):
             value = value_str
+        else:
+            self._error(f'Invalid {option} value: {value_str}')
 
         if option not in self._options:
             self._options[option] = value
@@ -517,6 +597,11 @@ class SSHClientConfig(SSHConfig):
 
         ('AddressFamily',                   SSHConfig._set_address_family),
         ('BindAddress',                     SSHConfig._set_string),
+        ('CanonicalDomains',                SSHConfig._set_string_list),
+        ('CanonicalizeFallbackLocal',       SSHConfig._set_bool),
+        ('CanonicalizeHostname',            SSHConfig._set_canonicalize_host),
+        ('CanonicalizeMaxDots',             SSHConfig._set_int),
+        ('CanonicalizePermittedCNAMEs',     SSHConfig._set_string_list),
         ('CASignatureAlgorithms',           SSHConfig._set_string),
         ('CertificateFile',                 SSHConfig._append_string),
         ('ChallengeResponseAuthentication', SSHConfig._set_bool),
@@ -524,7 +609,7 @@ class SSHClientConfig(SSHConfig):
         ('Compression',                     SSHConfig._set_bool),
         ('ConnectTimeout',                  SSHConfig._set_int),
         ('EnableSSHKeySign',                SSHConfig._set_bool),
-        ('ForwardAgent',                    SSHConfig._set_bool),
+        ('ForwardAgent',                    SSHConfig._set_bool_or_str),
         ('ForwardX11Trusted',               SSHConfig._set_bool),
         ('GlobalKnownHostsFile',            SSHConfig._set_string_list),
         ('GSSAPIAuthentication',            SSHConfig._set_bool),
@@ -544,7 +629,7 @@ class SSHClientConfig(SSHConfig):
         ('PKCS11Provider',                  SSHConfig._set_string),
         ('PreferredAuthentications',        SSHConfig._set_string),
         ('Port',                            SSHConfig._set_int),
-        ('ProxyCommand',                    SSHConfig._set_string_list),
+        ('ProxyCommand',                    SSHConfig._set_string),
         ('ProxyJump',                       SSHConfig._set_string),
         ('PubkeyAuthentication',            SSHConfig._set_bool),
         ('RekeyLimit',                      SSHConfig._set_rekey_limits),
@@ -553,7 +638,8 @@ class SSHClientConfig(SSHConfig):
         ('SendEnv',                         SSHConfig._append_string_list),
         ('ServerAliveCountMax',             SSHConfig._set_int),
         ('ServerAliveInterval',             SSHConfig._set_int),
-        ('SetEnv',                          SSHConfig._append_string_list),
+        ('SetEnv',                          SSHConfig._set_string_list),
+        ('Tag',                             SSHConfig._set_string),
         ('TCPKeepAlive',                    SSHConfig._set_bool),
         ('User',                            SSHConfig._set_string),
         ('UserKnownHostsFile',              SSHConfig._set_string_list)
@@ -564,9 +650,9 @@ class SSHServerConfig(SSHConfig):
     """Settings from an OpenSSH server config file"""
 
     def __init__(self, last_config: 'SSHConfig', reload: bool,
-                 local_addr: str, local_port: int, user: str,
-                 host: str, addr: str) -> None:
-        super().__init__(last_config, reload)
+                 canonical: bool, final: bool, local_addr: str,
+                 local_port: int, user: str, host: str, addr: str) -> None:
+        super().__init__(last_config, reload, canonical, final)
 
         self._local_addr = local_addr
         self._local_port = local_port
@@ -603,6 +689,11 @@ class SSHServerConfig(SSHConfig):
         ('AuthorizedKeysFile',              SSHConfig._set_string_list),
         ('AllowAgentForwarding',            SSHConfig._set_bool),
         ('BindAddress',                     SSHConfig._set_string),
+        ('CanonicalDomains',                SSHConfig._set_string_list),
+        ('CanonicalizeFallbackLocal',       SSHConfig._set_bool),
+        ('CanonicalizeHostname',            SSHConfig._set_canonicalize_host),
+        ('CanonicalizeMaxDots',             SSHConfig._set_int),
+        ('CanonicalizePermittedCNAMEs',     SSHConfig._set_string_list),
         ('CASignatureAlgorithms',           SSHConfig._set_string),
         ('ChallengeResponseAuthentication', SSHConfig._set_bool),
         ('Ciphers',                         SSHConfig._set_string),

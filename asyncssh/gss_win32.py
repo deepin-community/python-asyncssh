@@ -1,4 +1,4 @@
-# Copyright (c) 2017-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2017-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -35,6 +35,7 @@ from sspicon import ASC_RET_INTEGRITY, ASC_RET_MUTUAL_AUTH
 from sspicon import SECPKG_ATTR_NATIVE_NAMES
 
 from .asn1 import ObjectIdentifier, der_encode
+from .misc import BytesOrStrDict
 
 
 _krb5_oid = der_encode(ObjectIdentifier('1.2.840.113554.1.2.2'))
@@ -135,7 +136,7 @@ class GSSBase:
 
         try:
             return self._ctx.sign(data)
-        except SSPIError as exc:
+        except SSPIError as exc: # pragna: no cover
             raise GSSError(details=exc.strerror) from None
 
     def verify(self, data: bytes, sig: bytes) -> bool:
@@ -156,7 +157,11 @@ class GSSClient(GSSBase):
     _mutual_auth_flag = ISC_RET_MUTUAL_AUTH
     _integrity_flag = ISC_RET_INTEGRITY
 
-    def __init__(self, host: str, delegate_creds: bool):
+    def __init__(self, host: str, store: Optional[BytesOrStrDict],
+                 delegate_creds: bool):
+        if store is not None: # pragna: no cover
+            raise GSSError(details='GSS store not supported on Windows')
+
         super().__init__(host)
 
         flags = ISC_REQ_MUTUAL_AUTH | ISC_REQ_INTEGRITY
@@ -167,7 +172,7 @@ class GSSClient(GSSBase):
         try:
             self._ctx = ClientAuth('Kerberos', targetspn=self._host,
                                    scflags=flags)
-        except SSPIError as exc:
+        except SSPIError as exc: # pragna: no cover
             raise GSSError(1, 1, details=exc.strerror) from None
 
         self._init_token = self.step(None)
@@ -179,7 +184,10 @@ class GSSServer(GSSBase):
     _mutual_auth_flag = ASC_RET_MUTUAL_AUTH
     _integrity_flag = ASC_RET_INTEGRITY
 
-    def __init__(self, host: str):
+    def __init__(self, host: str, store: Optional[BytesOrStrDict]):
+        if store is not None: # pragna: no cover
+            raise GSSError(details='GSS store not supported on Windows')
+
         super().__init__(host)
 
         flags = ASC_REQ_MUTUAL_AUTH | ASC_REQ_INTEGRITY
@@ -194,7 +202,7 @@ class GSSError(Exception):
     """Class for reporting GSS errors"""
 
     def __init__(self, maj_code: int = 0, min_code: int = 0,
-                 token: bytes = None, details: str = ''):
+                 token: Optional[bytes] = None, details: str = ''):
         super().__init__(details)
 
         self.maj_code = maj_code

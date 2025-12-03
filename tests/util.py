@@ -1,4 +1,4 @@
-# Copyright (c) 2015-2020 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2015-2022 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -24,6 +24,8 @@ import asyncio
 import binascii
 import functools
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -31,13 +33,23 @@ import unittest
 
 from unittest.mock import patch
 
-# pylint: disable=unused-import
+from asyncssh import set_default_skip_rsa_key_validation
+from asyncssh.gss import gss_available
+from asyncssh.logging import logger
+from asyncssh.misc import ConnectionLost, SignalReceived
+from asyncssh.packet import Byte, String, UInt32, UInt64
+from asyncssh.public_key import generate_private_key
+
+
+# pylint: disable=ungrouped-imports, unused-import
 
 try:
     import bcrypt
     bcrypt_available = hasattr(bcrypt, 'kdf')
 except ImportError: # pragma: no cover
     bcrypt_available = False
+
+nc_available = bool(shutil.which('nc'))
 
 try:
     import uvloop
@@ -51,24 +63,23 @@ try:
 except ImportError: # pragma: no cover
     x509_available = False
 
-# pylint: enable=unused-import
-
-from asyncssh.gss import gss_available
-from asyncssh.logging import logger
-from asyncssh.misc import ConnectionLost, SignalReceived
-from asyncssh.packet import Byte, String, UInt32, UInt64
-
+# pylint: enable=ungrouped-imports, unused-import
 
 # pylint: disable=no-member
 
 if hasattr(asyncio, 'all_tasks'):
     all_tasks = asyncio.all_tasks
     current_task = asyncio.current_task
-else:
+else: # pragma: no cover
     all_tasks = asyncio.Task.all_tasks
     current_task = asyncio.Task.current_task
 
 # pylint: enable=no-member
+
+
+_test_keys = {}
+
+set_default_skip_rsa_key_validation(True)
 
 
 def asynctest(coro):
@@ -83,6 +94,31 @@ def asynctest(coro):
     return async_wrapper
 
 
+def patch_getaddrinfo(cls):
+    """Decorator for patching socket.getaddrinfo"""
+
+    # pylint: disable=redefined-builtin
+
+    cls.orig_getaddrinfo = socket.getaddrinfo
+
+    hosts = {'testhost.test': '',
+             'testcname.test': 'cname.test',
+             'cname.test': ''}
+
+    def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        """Mock DNS lookup of server hostname"""
+
+        # pylint: disable=unused-argument
+
+        try:
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                     hosts[host], ('127.0.0.1', port))]
+        except KeyError:
+            return cls.orig_getaddrinfo(host, port, family, type, proto, flags)
+
+    return patch('socket.getaddrinfo', getaddrinfo)(cls)
+
+
 def patch_getnameinfo(cls):
     """Decorator for patching socket.getnameinfo"""
 
@@ -94,6 +130,33 @@ def patch_getnameinfo(cls):
         return ('localhost', sockaddr[1])
 
     return patch('socket.getnameinfo', getnameinfo)(cls)
+
+
+def patch_getnameinfo_error(cls):
+    """Decorator for patching socket.getnameinfo to raise an error"""
+
+    def getnameinfo_error(sockaddr, flags):
+        """Mock failure of reverse DNS lookup of client address"""
+
+        # pylint: disable=unused-argument
+
+        raise socket.gaierror()
+
+    return patch('socket.getnameinfo', getnameinfo_error)(cls)
+
+
+def patch_extra_kex(cls):
+    """Decorator for skipping extra kex algs"""
+
+    def skip_extra_kex_algs(self):
+        """Don't send extra key exchange algorithms"""
+
+        # pylint: disable=unused-argument
+
+        return []
+
+    return patch('asyncssh.connection.SSHConnection._get_extra_kex_algs',
+                 skip_extra_kex_algs)(cls)
 
 
 def patch_gss(cls):
@@ -157,6 +220,20 @@ def _encode_options(options):
     return b''.join((String(k) + String(v) for k, v in options.items()))
 
 
+def get_test_key(alg_name, key_id=0, **kwargs):
+    """Generate or return a key with the requested parameters"""
+
+    params = tuple((alg_name, key_id)) + tuple(kwargs.items())
+
+    try:
+        key = _test_keys[params]
+    except KeyError:
+        key = generate_private_key(alg_name, **kwargs)
+        _test_keys[params] = key
+
+    return key
+
+
 def make_certificate(cert_version, cert_type, key, signing_key, principals,
                      key_id='name', valid_after=0,
                      valid_before=0xffffffffffffffff, options=None,
@@ -164,7 +241,7 @@ def make_certificate(cert_version, cert_type, key, signing_key, principals,
     """Construct an SSH certificate"""
 
     keydata = key.encode_ssh_public()
-    principals = b''.join((String(p) for p in principals))
+    principals = b''.join(String(p) for p in principals)
     options = _encode_options(options) if options else b''
     extensions = _encode_options(extensions) if extensions else b''
     signing_keydata = b''.join((String(signing_key.algorithm),
@@ -179,7 +256,7 @@ def make_certificate(cert_version, cert_type, key, signing_key, principals,
     if bad_signature:
         data += String('')
     else:
-        data += String(signing_key.sign(data, signing_key.algorithm))
+        data += String(signing_key.sign(data, signing_key.sig_algorithms[0]))
 
     return b''.join((cert_version.encode('ascii'), b' ',
                      binascii.b2a_base64(data)))
@@ -195,6 +272,15 @@ def run(cmd):
         logger.error('Error running command: %s' % cmd)
         logger.error(exc.output.decode())
         raise
+
+
+def try_remove(filename):
+    """Try to remove a file, ignoring errors"""
+
+    try:
+        os.remove(filename)
+    except OSError: # pragma: no cover
+        pass
 
 
 class ConnectionStub:
@@ -262,7 +348,7 @@ class ConnectionStub:
                 self.connection_lost(data)
                 break
 
-            self.process_packet(data)
+            await self.process_packet(data)
 
     def connection_lost(self, exc):
         """Handle the closing of a connection"""
@@ -361,8 +447,6 @@ class AsyncTestCase(TempDirTestCase):
             cls.loop = uvloop.new_event_loop()
         else:
             cls.loop = asyncio.new_event_loop()
-
-        asyncio.set_event_loop(cls.loop)
 
         try:
             cls.loop.run_until_complete(cls.asyncSetUpClass())

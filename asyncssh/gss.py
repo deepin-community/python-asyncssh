@@ -1,4 +1,4 @@
-# Copyright (c) 2017-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2017-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -22,6 +22,11 @@
 
 import sys
 
+from typing import Optional
+
+from .misc import BytesOrStrDict
+
+
 try:
     # pylint: disable=unused-import
 
@@ -37,8 +42,8 @@ except ImportError: # pragma: no cover
     class GSSError(ValueError): # type: ignore
         """Stub class for reporting that GSS is not available"""
 
-        def __init__(self, maj_code: int = 0, min_code: int = 0,
-                     token: bytes = None):
+        def __init__(self, maj_code: int, min_code: int,
+                 token: Optional[bytes] = None):
             super().__init__('GSS not available')
 
             self.maj_code = maj_code
@@ -51,11 +56,12 @@ except ImportError: # pragma: no cover
     class GSSClient(GSSBase): # type: ignore
         """Stub client class for reporting that GSS is not available"""
 
-        def __init__(self, _host: str, _delegate_creds: bool):
-            raise GSSError()
+        def __init__(self, _host: str, _store: Optional[BytesOrStrDict],
+                     _delegate_creds: bool):
+            raise GSSError(0, 0)
 
     class GSSServer(GSSBase): # type: ignore
         """Stub client class for reporting that GSS is not available"""
 
-        def __init__(self, _host: str):
-            raise GSSError()
+        def __init__(self, _host: str, _store: Optional[BytesOrStrDict]):
+            raise GSSError(0, 0)

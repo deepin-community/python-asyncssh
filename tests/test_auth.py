@@ -1,4 +1,4 @@
-# Copyright (c) 2015-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2015-2025 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -21,6 +21,7 @@
 """Unit tests for authentication"""
 
 import asyncio
+import inspect
 import unittest
 
 import asyncssh
@@ -34,7 +35,7 @@ from asyncssh.gss import GSSClient, GSSServer
 from asyncssh.packet import SSHPacket, Boolean, Byte, NameList, String
 
 from .util import asynctest, gss_available, patch_gss
-from .util import AsyncTestCase, ConnectionStub
+from .util import AsyncTestCase, ConnectionStub, get_test_key
 
 
 class _AuthConnectionStub(ConnectionStub):
@@ -45,7 +46,7 @@ class _AuthConnectionStub(ConnectionStub):
 
         raise NotImplementedError
 
-    def process_packet(self, data):
+    async def process_packet(self, data):
         """Process an incoming packet"""
 
         raise NotImplementedError
@@ -96,7 +97,7 @@ class _AuthClientStub(_AuthConnectionStub):
                                          password_change_prompt, kbdint_auth,
                                          kbdint_challenge, success), False)
 
-        self._gss = GSSClient(gss_host, False) if gss_host else None
+        self._gss = GSSClient(gss_host, None, False) if gss_host else None
 
         self._client_host_key = client_host_key
         self._client_host_cert = client_host_cert
@@ -126,7 +127,7 @@ class _AuthClientStub(_AuthConnectionStub):
 
         self.close()
 
-    def process_packet(self, data):
+    async def process_packet(self, data):
         """Process an incoming packet"""
 
         packet = SSHPacket(data)
@@ -154,15 +155,20 @@ class _AuthClientStub(_AuthConnectionStub):
             self._auth = None
             self._auth_waiter = None
         else:
-            self._auth.process_packet(pkttype, None, packet)
+            result = self._auth.process_packet(pkttype, None, packet)
+
+            if inspect.isawaitable(result):
+                await result
 
     async def get_auth_result(self):
         """Return the result of the authentication"""
 
         return await self._auth_waiter
 
-    def try_next_auth(self):
+    def try_next_auth(self, *, next_method=False):
         """Handle a request to move to another form of auth"""
+
+        # pylint: disable=unused-argument
 
         # Report that the current auth attempt failed
         self._auth_waiter.set_result((False, self._password_changed))
@@ -259,7 +265,7 @@ class _AuthServerStub(_AuthConnectionStub):
                  kbdint_challenge=False, success=False):
         super().__init__(peer, True)
 
-        self._gss = GSSServer(gss_host) if gss_host else None
+        self._gss = GSSServer(gss_host, None) if gss_host else None
         self._override_gss_mech = override_gss_mech
 
         self._host_based_auth = host_based_auth
@@ -285,7 +291,7 @@ class _AuthServerStub(_AuthConnectionStub):
 
         self.close()
 
-    def process_packet(self, data):
+    async def process_packet(self, data):
         """Process an incoming packet"""
 
         packet = SSHPacket(data)
@@ -308,7 +314,10 @@ class _AuthServerStub(_AuthConnectionStub):
             else:
                 self._auth = lookup_server_auth(self, 'user', method, packet)
         else:
-            self._auth.process_packet(pkttype, None, packet)
+            result = self._auth.process_packet(pkttype, None, packet)
+
+            if inspect.isawaitable(result):
+                await result
 
     def send_userauth_failure(self, partial_success):
         """Send a user authentication failure response"""
@@ -317,7 +326,7 @@ class _AuthServerStub(_AuthConnectionStub):
         self.send_userauth_packet(MSG_USERAUTH_FAILURE, NameList([]),
                                   Boolean(partial_success))
 
-    def send_userauth_success(self):
+    async def send_userauth_success(self):
         """Send a user authentication success response"""
 
         self._auth = None
@@ -517,7 +526,7 @@ class _TestAuth(AsyncTestCase):
     async def test_hostbased_auth(self):
         """Unit test host-based authentication"""
 
-        hkey = asyncssh.generate_private_key('ssh-rsa')
+        hkey = get_test_key('ecdsa-sha2-nistp256')
         cert = hkey.generate_host_certificate(hkey, 'host')
 
         with self.subTest('Host-based auth not available'):
@@ -541,7 +550,7 @@ class _TestAuth(AsyncTestCase):
     async def test_publickey_auth(self):
         """Unit test public key authentication"""
 
-        ckey = asyncssh.generate_private_key('ssh-rsa')
+        ckey = get_test_key('ecdsa-sha2-nistp256')
         cert = ckey.generate_user_certificate(ckey, 'name')
 
         with self.subTest('Public key auth not available'):

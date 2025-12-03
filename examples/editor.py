@@ -1,6 +1,6 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3.7
 #
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -33,8 +33,8 @@ from typing import cast
 async def handle_client(process: asyncssh.SSHServerProcess):
     channel = cast(asyncssh.SSHLineEditorChannel, process.channel)
 
-    process.stdout.write('Welcome to my SSH server, %s!\n\n' %
-                         process.get_extra_info('username'))
+    username = process.get_extra_info('username')
+    process.stdout.write(f'Welcome to my SSH server, {username}!\n\n')
 
     channel.set_echo(False)
     process.stdout.write('Tell me a secret: ')
@@ -53,7 +53,7 @@ async def start_server() -> None:
                           authorized_client_keys='ssh_user_ca',
                           process_factory=handle_client)
 
-loop = asyncio.get_event_loop()
+loop = asyncio.new_event_loop()
 
 try:
     loop.run_until_complete(start_server())

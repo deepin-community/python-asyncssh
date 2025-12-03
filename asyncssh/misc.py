@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2025 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -20,17 +20,22 @@
 
 """Miscellaneous utility classes and functions"""
 
+import asyncio
+import fnmatch
 import functools
 import ipaddress
+import os
 import re
+import shlex
 import socket
+import sys
 
 from pathlib import Path, PurePath
 from random import SystemRandom
 from types import TracebackType
 from typing import Any, AsyncContextManager, Awaitable, Callable, Dict
-from typing import Generator, Generic, IO, Mapping, Optional, Sequence
-from typing import Tuple, Type, TypeVar, Union, cast, overload
+from typing import Generator, Generic, IO, Iterator, Mapping, Optional
+from typing import Sequence, Tuple, Type, TypeVar, Union, cast, overload
 from typing_extensions import Literal, Protocol
 
 from .constants import DEFAULT_LANG
@@ -40,6 +45,27 @@ from .constants import DISC_KEY_EXCHANGE_FAILED, DISC_MAC_ERROR
 from .constants import DISC_NO_MORE_AUTH_METHODS_AVAILABLE
 from .constants import DISC_PROTOCOL_ERROR, DISC_PROTOCOL_VERSION_NOT_SUPPORTED
 from .constants import DISC_SERVICE_NOT_AVAILABLE
+
+_pywin32_available = False
+
+if sys.platform == 'win32': # pragma: no cover
+    try:
+        import msvcrt
+        import win32file
+        import winioctlcon
+        _pywin32_available = True
+    except ImportError:
+        pass
+
+if sys.platform != 'win32': # pragma: no branch
+    import fcntl
+    import struct
+    import termios
+
+TermModes = Mapping[int, int]
+TermModesArg = Optional[TermModes]
+TermSize = Tuple[int, int, int, int]
+TermSizeArg = Union[None, Tuple[int, int], TermSize]
 
 
 class _Hash(Protocol):
@@ -89,12 +115,17 @@ ExcInfo = Tuple[Type[BaseException], BaseException, TracebackType]
 OptExcInfo = Union[ExcInfo, Tuple[None, None, None]]
 
 BytesOrStr = Union[bytes, str]
+BytesOrStrDict = Dict[BytesOrStr, BytesOrStr]
 FilePath = Union[str, PurePath]
 HostPort = Tuple[str, int]
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 SockAddr = Union[Tuple[str, int], Tuple[str, int, int, int]]
 
+EnvMap = Mapping[BytesOrStr, BytesOrStr]
+EnvItems = Sequence[Tuple[BytesOrStr, BytesOrStr]]
+EnvSeq = Sequence[BytesOrStr]
+Env = Union[EnvMap, EnvItems, EnvSeq]
 
 # Define a version of randrange which is based on SystemRandom(), so that
 # we get back numbers suitable for cryptographic use.
@@ -107,6 +138,62 @@ _time_units = {'': 1, 's': 1, 'm': 60, 'h': 60*60,
                'd': 24*60*60, 'w': 7*24*60*60}
 
 
+def encode_env(env: Env) -> Iterator[Tuple[bytes, bytes]]:
+    """Convert environemnt dict or list to bytes-based dictionary"""
+
+    if hasattr(env, 'items'):
+        env = cast(Env, env.items())
+
+    try:
+        for item in env:
+            if isinstance(item, (bytes, str)):
+                if isinstance(item, str):
+                    item = item.encode('utf-8')
+
+                key_bytes, value_bytes = item.split(b'=', 1)
+            else:
+                key, value = item
+
+                key_bytes = key.encode('utf-8') \
+                    if isinstance(key, str) else key
+
+                value_bytes = value.encode('utf-8') \
+                    if isinstance(value, str) else value
+
+            yield key_bytes, value_bytes
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'Invalid environment value: {exc}') from None
+
+
+def lookup_env(patterns: EnvSeq) -> Iterator[Tuple[bytes, bytes]]:
+    """Look up environemnt variables with wildcard matches"""
+
+    for pattern in patterns:
+        if isinstance(pattern, str):
+            pattern = pattern.encode('utf-8')
+
+        if os.supports_bytes_environ:
+            for key_bytes, value_bytes in os.environb.items():
+                if fnmatch.fnmatch(key_bytes, pattern):
+                    yield key_bytes, value_bytes
+        else: # pragma: no cover
+            for key, value in os.environ.items():
+                key_bytes = key.encode('utf-8')
+                value_bytes = value.encode('utf-8')
+                if fnmatch.fnmatch(key_bytes, pattern):
+                    yield key_bytes, value_bytes
+
+
+def decode_env(env: Dict[bytes, bytes]) -> Iterator[Tuple[str, str]]:
+    """Convert bytes-based environemnt dict to Unicode strings"""
+
+    for key, value in env.items():
+        try:
+            yield key.decode('utf-8'), value.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
+
+
 def hide_empty(value: object, prefix: str = ', ') -> str:
     """Return a string with optional prefix if value is non-empty"""
 
@@ -117,7 +204,7 @@ def hide_empty(value: object, prefix: str = ', ') -> str:
 def plural(length: int, label: str, suffix: str = 's') -> str:
     """Return a label with an optional plural suffix"""
 
-    return '%d %s%s' % (length, label, suffix if length != 1 else '')
+    return f'{length} {label}{suffix if length != 1 else ""}'
 
 
 def all_ints(seq: Sequence[object]) -> bool:
@@ -229,6 +316,19 @@ def write_file(filename: FilePath, data: bytes, mode: str = 'wb') -> int:
         return f.write(data)
 
 
+if sys.platform == 'win32' and _pywin32_available: # pragma: no cover
+    def make_sparse_file(file_obj: IO) -> None:
+        """Enable sparse file support on a file on Windows"""
+
+        handle = msvcrt.get_osfhandle(file_obj.fileno())
+
+        win32file.DeviceIoControl(handle, winioctlcon.FSCTL_SET_SPARSE,
+                                  b'', 0, None)
+else:
+    def make_sparse_file(_file_obj: IO) -> None:
+        """Sparse files are automatically enabled on non-Windows systems"""
+
+
 def _parse_units(value: str, suffixes: Mapping[str, int], label: str) -> float:
     """Parse a series of integers followed by unit suffixes"""
 
@@ -256,6 +356,18 @@ def parse_time_interval(value: str) -> float:
     """Parse a time interval with optional s, m, h, d, or w suffixes"""
 
     return _parse_units(value, _time_units, 'time interval')
+
+
+def split_args(command: str) -> Sequence[str]:
+    """Split a command string into a list of arguments"""
+
+    lex = shlex.shlex(command, posix=True)
+    lex.whitespace_split = True
+
+    if sys.platform == 'win32': # pragma: no cover
+        lex.escape = []
+
+    return list(lex)
 
 
 _ACM = TypeVar('_ACM', bound=AsyncContextManager, covariant=True)
@@ -331,6 +443,22 @@ async def maybe_wait_closed(writer: '_SupportsWaitClosed') -> None:
         pass
 
 
+async def run_in_executor(func: Callable[..., _T], *args: object) -> _T:
+    """Run a function in an asyncio executor"""
+
+    loop = asyncio.get_event_loop()
+
+    return await loop.run_in_executor(None, func, *args)
+
+
+def set_terminal_size(tty: IO, width: int, height: int,
+                      pixwidth: int, pixheight: int) -> None:
+    """Set the terminal size of a TTY"""
+
+    fcntl.ioctl(tty, termios.TIOCSWINSZ,
+                struct.pack('hhhh', height, width, pixwidth, pixheight))
+
+
 class Options:
     """Container for configuration options"""
 
@@ -339,8 +467,8 @@ class Options:
     def __init__(self, options: Optional['Options'] = None, **kwargs: object):
         if options:
             if not isinstance(options, type(self)):
-                raise TypeError('Invalid %s, got %s' %
-                                (type(self).__name__, type(options).__name__))
+                raise TypeError(f'Invalid {type(self).__name__}, '
+                                f'got {type(options).__name__}')
 
             self.kwargs = options.kwargs.copy()
         else:
@@ -352,7 +480,7 @@ class Options:
     def prepare(self, **kwargs: object) -> None:
         """Pre-process configuration options"""
 
-    def update(self, kwargs: Dict[str, object]) -> None:
+    def update(self, **kwargs: object) -> None:
         """Update options based on keyword parameters passed in"""
 
         self.kwargs.update(kwargs)
@@ -362,17 +490,18 @@ class Options:
 class _RecordMeta(type):
     """Metaclass for general-purpose record type"""
 
+    __slots__: Dict[str, object] = {}
+
     def __new__(mcs: Type['_RecordMeta'], name: str, bases: Tuple[type, ...],
                 ns: Dict[str, object]) -> '_RecordMeta':
+        cls = cast(_RecordMeta, super().__new__(mcs, name, bases, ns))
+
         if name != 'Record':
-            fields = cast(Mapping[str, str],
-                          ns.get('__annotations__', {})).keys()
+            fields = cast(Mapping[str, str], cls.__annotations__.keys())
             defaults = {k: ns.get(k) for k in fields}
+            cls.__slots__ = defaults
 
-            ns = {k: v for k, v in ns.items() if k not in fields}
-            ns['__slots__'] = defaults
-
-        return cast(_RecordMeta, super().__new__(mcs, name, bases, ns))
+        return cls
 
 
 class Record(metaclass=_RecordMeta):
@@ -391,15 +520,15 @@ class Record(metaclass=_RecordMeta):
             setattr(self, k, v)
 
     def __repr__(self) -> str:
-        return '%s(%s)' % (type(self).__name__,
-                           ', '.join('%s=%r' % (k, getattr(self, k))
-                                     for k in self.__slots__))
+        values = ', '.join(f'{k}={getattr(self, k)!r}' for k in self.__slots__)
+
+        return f'{type(self).__name__}({values})'
 
     def __str__(self) -> str:
         values = ((k, self._format(k, getattr(self, k)))
                   for k in self.__slots__)
 
-        return ', '.join('%s: %s' % (k, v) for k, v in values if v is not None)
+        return ', '.join(f'{k}: {v}' for k, v in values if v is not None)
 
     def _format(self, k: str, v: object) -> Optional[str]:
         """Format a field as a string"""
@@ -684,7 +813,7 @@ class PasswordChangeRequired(Exception):
     """
 
     def __init__(self, prompt: str, lang: str = DEFAULT_LANG):
-        super().__init__('Password change required: %s' % prompt)
+        super().__init__(f'Password change required: {prompt}')
         self.prompt = prompt
         self.lang = lang
 
@@ -702,7 +831,7 @@ class BreakReceived(Exception):
     """
 
     def __init__(self, msec: int):
-        super().__init__('Break for %s msec' % msec)
+        super().__init__(f'Break for {msec} msec')
         self.msec = msec
 
 
@@ -719,7 +848,7 @@ class SignalReceived(Exception):
     """
 
     def __init__(self, signal: str):
-        super().__init__('Signal: %s' % signal)
+        super().__init__(f'Signal: {signal}')
         self.signal = signal
 
 
@@ -757,12 +886,18 @@ class TerminalSizeChanged(Exception):
     """
 
     def __init__(self, width: int, height: int, pixwidth: int, pixheight: int):
-        super().__init__('Terminal size change: (%s, %s, %s, %s)' %
-                         (width, height, pixwidth, pixheight))
+        super().__init__(f'Terminal size change: ({width}, {height}, '
+                         f'{pixwidth}, {pixheight})')
         self.width = width
         self.height = height
         self.pixwidth = pixwidth
         self.pixheight = pixheight
+
+    @property
+    def term_size(self) -> TermSize:
+        """Return terminal size as a tuple of 4 integers"""
+
+        return self.width, self.height, self.pixwidth, self.pixheight
 
 
 _disc_error_map = {
@@ -785,4 +920,4 @@ def construct_disc_error(code: int, reason: str, lang: str) -> DisconnectError:
     try:
         return _disc_error_map[code](reason, lang)
     except KeyError:
-        return DisconnectError(code, '%s (error %d)' % (reason, code), lang)
+        return DisconnectError(code, f'{reason} (error {code})', lang)

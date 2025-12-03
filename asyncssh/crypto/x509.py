@@ -55,11 +55,9 @@ _purpose_any = '2.5.29.37.0'
 
 _nscomment_oid = x509.ObjectIdentifier('2.16.840.1.113730.1.13')
 
-_datetime_min = datetime.utcfromtimestamp(0).replace(microsecond=1,
-                                                     tzinfo=timezone.utc)
+_datetime_min = datetime.fromtimestamp(0, timezone.utc).replace(microsecond=1)
 
-_datetime_32bit_max = datetime.utcfromtimestamp(2**31 - 1).replace(
-    tzinfo=timezone.utc)
+_datetime_32bit_max = datetime.fromtimestamp(2**31 - 1, timezone.utc)
 
 if sys.platform == 'win32': # pragma: no cover
     # Windows' datetime.max is year 9999, but timestamps that large don't work
@@ -75,12 +73,13 @@ def _to_generalized_time(t: int) -> datetime:
         return _datetime_min
     else:
         try:
-            return datetime.utcfromtimestamp(t).replace(tzinfo=timezone.utc)
+            return datetime.fromtimestamp(t, timezone.utc)
         except (OSError, OverflowError):
             try:
                 # Work around a bug in cryptography which shows up on
                 # systems with a small time_t.
-                datetime.utcfromtimestamp(_datetime_max.timestamp() - 1)
+                datetime.fromtimestamp(_datetime_max.timestamp() - 1,
+                                       timezone.utc)
                 return _datetime_max
             except (OSError, OverflowError): # pragma: no cover
                 return _datetime_32bit_max
@@ -95,8 +94,8 @@ def _to_purpose_oids(purposes: _Purposes) -> _PurposeOIDs:
     if not purposes or 'any' in purposes or _purpose_any in purposes:
         purpose_oids = None
     else:
-        purpose_oids = set(_purpose_to_oid.get(p) or x509.ObjectIdentifier(p)
-                           for p in purposes)
+        purpose_oids = {_purpose_to_oid.get(p) or x509.ObjectIdentifier(p)
+                           for p in purposes}
 
     return purpose_oids
 
@@ -144,8 +143,8 @@ class X509Name(x509.Name):
         ('CN', x509.NameOID.COMMON_NAME),
         ('DC', x509.NameOID.DOMAIN_COMPONENT))
 
-    _to_oid = dict((k, v) for k, v in _attrs)
-    _from_oid = dict((v, k) for k, v in _attrs)
+    _to_oid = dict(_attrs)
+    _from_oid = {v: k for k, v in _attrs}
 
     def __init__(self, name: _NameInit):
         if isinstance(name, str):
@@ -169,7 +168,7 @@ class X509Name(x509.Name):
         """Format an X.509 NameAttribute as a string"""
 
         attr = self._from_oid.get(nameattr.oid) or nameattr.oid.dotted_string
-        return attr + '=' + self._escape.sub(r'\\\1', nameattr.value)
+        return attr + '=' + self._escape.sub(r'\\\1', cast(str, nameattr.value))
 
     def _parse_name(self, name: str) -> \
             Iterable[x509.RelativeDistinguishedName]:
@@ -261,7 +260,7 @@ class X509Certificate:
                 [str(ip) for ip in sans.get_values_for_type(x509.IPAddress)]
         except x509.ExtensionNotFound:
             cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
-            principals = [attr.value for attr in cn]
+            principals = [cast(str, attr.value) for attr in cn]
 
             self.user_principals = principals
             self.host_principals = principals
@@ -309,7 +308,7 @@ class X509Certificate:
                                                None)
             x509_ctx.verify_certificate()
         except crypto.X509StoreContextError as exc:
-            raise ValueError(str(exc)) from None
+            raise ValueError(f'X.509 chain validation error: {exc}') from None
 
 
 def generate_x509_certificate(signing_key: PyCAKey, key: PyCAKey,
@@ -405,7 +404,8 @@ def generate_x509_certificate(signing_key: PyCAKey, key: PyCAKey,
     except KeyError:
         raise ValueError('Unknown hash algorithm') from None
 
-    cert = builder.sign(cast(PyCAPrivateKey, signing_key), hash_alg)
+    cert = builder.sign(cast(PyCAPrivateKey, signing_key),
+                        hash_alg) # type: ignore
     data = cert.public_bytes(Encoding.DER)
 
     return X509Certificate(cert, data)

@@ -25,9 +25,7 @@ import unittest
 
 from cryptography import x509
 
-import asyncssh
-
-from .util import x509_available
+from .util import get_test_key, x509_available
 
 if x509_available: # pragma: no branch
     from asyncssh.crypto import X509Name, X509NamePattern
@@ -43,7 +41,7 @@ class _TestX509(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._privkey = asyncssh.generate_private_key('ssh-rsa')
+        cls._privkey = get_test_key('ssh-rsa')
         cls._pubkey = cls._privkey.convert_to_public()
         cls._pubdata = cls._pubkey.export_public_key('pkcs8-der')
 
@@ -81,7 +79,7 @@ class _TestX509(unittest.TestCase):
 
         cert = self.generate_certificate(purposes='secureShellClient')
 
-        self.assertEqual(cert.purposes, set((_purpose_secureShellClient,)))
+        self.assertEqual(cert.purposes, {_purpose_secureShellClient})
 
     def test_generate_ca(self):
         """Test X.509 CA certificate generation"""

@@ -29,7 +29,26 @@ key doesn't match.
       :literal:
       :start-line: 22
 
-This example only uses the output on stdout, but output on stderr is also
+This example shows using the :class:`SSHClientConnection` returned by
+:func:`connect()` as a context manager, so that the connection is
+automatically closed when the end of the code block which opened it is
+reached. However, if you need the connection object to live longer, you
+can use "await" instead of "async with":
+
+   .. code::
+
+     conn = await asyncssh.connect('localhost')
+
+In this case, the application will need to close the connection explicitly
+when done with it, and it is best to also wait for the close to complete.
+This can be done with the following code from inside an async function:
+
+   .. code::
+
+     conn.close()
+     await conn.wait_closed()
+
+Only stdout is referenced this example, but output on stderr is also
 collected as another attribute in the returned :class:`SSHCompletedProcess`
 object.
 
@@ -38,7 +57,7 @@ write calls operate on strings by default. If you want to send and
 receive binary data, you can set the encoding to `None` when the
 session is opened to make read and write operate on bytes instead.
 Alternate encodings can also be selected to change how strings are
-convered to and from bytes.
+converted to and from bytes.
 
 To check against a different set of server host keys, they can be provided
 in the known_hosts argument when the connection is opened:
@@ -435,7 +454,7 @@ write calls operate on strings by default. If you want to send and
 receive binary data, you can set the encoding to `None` when the
 session is opened to make read and write operate on bytes instead.
 Alternate encodings can also be selected to change how strings are
-convered to and from bytes.
+converted to and from bytes.
 
    .. include:: ../examples/simple_server.py
       :literal:
@@ -512,7 +531,7 @@ provide character echo and line editing. To better support interactive
 applications like the one above, AsyncSSH defaults to providing basic
 line editing for server sessions which request a pseudo-terminal.
 
-When thise line editor is enabled, it defaults to delivering input to
+When this line editor is enabled, it defaults to delivering input to
 the application a line at a time. Applications can switch between line
 and character at a time input using the :meth:`set_line_mode()
 <SSHLineEditorChannel.set_line_mode>` method. Also, when in line

@@ -1,6 +1,6 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3.7
 #
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -34,7 +34,7 @@ async def handle_client(process: asyncssh.SSHServerProcess) -> None:
         keywidth = max(map(len, process.env.keys()))+1
         process.stdout.write('Environment:\n')
         for key, value in process.env.items():
-            process.stdout.write('  %-*s %s\n' % (keywidth, key+':', value))
+            process.stdout.write(f'  {key+":":{keywidth}} {value}\n')
         process.exit(0)
     else:
         process.stderr.write('No environment sent.\n')
@@ -45,7 +45,7 @@ async def start_server() -> None:
                           authorized_client_keys='ssh_user_ca',
                           process_factory=handle_client)
 
-loop = asyncio.get_event_loop()
+loop = asyncio.new_event_loop()
 
 try:
     loop.run_until_complete(start_server())

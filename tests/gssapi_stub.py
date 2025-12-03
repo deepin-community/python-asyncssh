@@ -20,6 +20,8 @@
 
 """Stub GSSAPI module for unit tests"""
 
+from enum import IntEnum
+
 from asyncssh.gss import GSSError
 
 from .gss_stub import step
@@ -38,7 +40,9 @@ class Name:
 class Credentials:
     """Stub class for GSS credentials"""
 
-    def __init__(self, name=None, usage=None):
+    def __init__(self, name=None, usage=None, store=None):
+        # pylint: disable=unused-argument
+
         self.host = name.host if name else ''
         self.server = usage == 'accept'
 
@@ -52,12 +56,14 @@ class Credentials:
             return [2]
 
 
-class RequirementFlag:
+class RequirementFlag(IntEnum):
     """Stub class for GSS requirement flags"""
 
-    mutual_authentication = 'mutual_auth'
-    integrity = 'integrity'
-    delegate_to_peer = 'delegate'
+    # pylint: disable=invalid-name
+
+    delegate_to_peer = 1
+    mutual_authentication = 2
+    integrity = 4
 
 
 class SecurityContext:
@@ -67,12 +73,12 @@ class SecurityContext:
         host = creds.host if creds.server else name.host
 
         if flags is None:
-            flags = set((RequirementFlag.mutual_authentication,
-                         RequirementFlag.integrity))
+            flags = RequirementFlag.mutual_authentication | \
+                    RequirementFlag.integrity
 
         if ((creds.server and 'no_server_integrity' in host) or
                 (not creds.server and 'no_client_integrity' in host)):
-            flags.remove(RequirementFlag.integrity)
+            flags &= ~RequirementFlag.integrity
 
         self._host = host
         self._server = creds.server
@@ -121,7 +127,10 @@ class SecurityContext:
     def get_signature(self, _data):
         """Sign a block of data"""
 
-        return b'fail' if 'fail' in self._host else 'succeed'
+        if 'sign_error' in self._host:
+            raise GSSError(99, 99)
+
+        return b'fail' if 'verify_error' in self._host else b''
 
     def verify_signature(self, _data, sig):
         """Verify a signature for a block of data"""

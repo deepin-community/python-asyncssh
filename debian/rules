@@ -14,4 +14,4 @@ override_dh_installdocs:
 
 override_dh_auto_test:
 	env RES_OPTIONS=attempts:0 localehelper LANG=en_US.UTF-8 \
-		dh_auto_test -- --system=custom --test-args='{interpreter} -m unittest discover -v'
+		dh_auto_test
