@@ -1,13 +1,13 @@
 From: Vincent Bernat <vincent@bernat.im>
 Date: Sun, 3 Jan 2016 18:11:46 +0100
-Subject: skip tests requiring network access
+Subject: Skip tests requiring network access
 
 ---
  tests/test_auth_keys.py | 1 +
  1 file changed, 1 insertion(+)
 
 diff --git a/tests/test_auth_keys.py b/tests/test_auth_keys.py
-index 27d4190..eba49e1 100644
+index 9e1a05c..da8b3d7 100644
 --- a/tests/test_auth_keys.py
 +++ b/tests/test_auth_keys.py
 @@ -95,6 +95,7 @@ class _TestAuthorizedKeys(TempDirTestCase):

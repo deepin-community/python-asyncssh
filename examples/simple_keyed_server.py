@@ -1,6 +1,6 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3.7
 #
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -31,8 +31,8 @@
 import asyncio, asyncssh, sys
 
 def handle_client(process: asyncssh.SSHServerProcess) -> None:
-    process.stdout.write('Welcome to my SSH server, %s!\n' %
-                         process.get_extra_info('username'))
+    username = process.get_extra_info('username')
+    process.stdout.write(f'Welcome to my SSH server, {username}!\n')
     process.exit(0)
 
 class MySSHServer(asyncssh.SSHServer):
@@ -41,8 +41,8 @@ class MySSHServer(asyncssh.SSHServer):
 
     def begin_auth(self, username: str) -> bool:
         try:
-            self._conn.set_authorized_keys('authorized_keys/%s' % username)
-        except IOError:
+            self._conn.set_authorized_keys(f'authorized_keys/{username}')
+        except OSError:
             pass
 
         return True
@@ -52,7 +52,7 @@ async def start_server() -> None:
                                  server_host_keys=['ssh_host_key'],
                                  process_factory=handle_client)
 
-loop = asyncio.get_event_loop()
+loop = asyncio.new_event_loop()
 
 try:
     loop.run_until_complete(start_server())

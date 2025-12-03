@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2025 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -27,6 +27,7 @@ from .constants import DEFAULT_LANG
 from .gss import GSSBase, GSSError
 from .logging import SSHLogger
 from .misc import ProtocolError, PasswordChangeRequired, get_symbol_names
+from .misc import run_in_executor
 from .packet import Boolean, String, UInt32, SSHPacket, SSHPacketHandler
 from .public_key import SigningKey
 from .saslprep import saslprep, SASLPrepError
@@ -158,7 +159,7 @@ class _ClientGSSKexAuth(ClientAuth):
             await self.send_request(key=self._conn.get_gss_context(),
                                     trivial=False)
         else:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
 
 
 class _ClientGSSMICAuth(ClientAuth):
@@ -180,10 +181,10 @@ class _ClientGSSMICAuth(ClientAuth):
 
             self._gss = self._conn.get_gss_context()
             self._gss.reset()
-            mechs = b''.join((String(mech) for mech in self._gss.mechs))
+            mechs = b''.join(String(mech) for mech in self._gss.mechs)
             await self.send_request(UInt32(len(self._gss.mechs)), mechs)
         else:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
 
     def _finish(self) -> None:
         """Finish client GSS MIC authentication"""
@@ -199,8 +200,8 @@ class _ClientGSSMICAuth(ClientAuth):
         else:
             self.send_packet(MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE)
 
-    def _process_response(self, _pkttype: int, _pktid: int,
-                          packet: SSHPacket) -> None:
+    async def _process_response(self, _pkttype: int, _pktid: int,
+                                packet: SSHPacket) -> None:
         """Process a GSS response from the server"""
 
         mech = packet.get_string()
@@ -212,7 +213,7 @@ class _ClientGSSMICAuth(ClientAuth):
             raise ProtocolError('Mechanism mismatch')
 
         try:
-            token = self._gss.step()
+            token = await run_in_executor(self._gss.step)
             assert token is not None
 
             self.send_packet(MSG_USERAUTH_GSSAPI_TOKEN, String(token))
@@ -223,10 +224,10 @@ class _ClientGSSMICAuth(ClientAuth):
             if exc.token:
                 self.send_packet(MSG_USERAUTH_GSSAPI_ERRTOK, String(exc.token))
 
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
 
-    def _process_token(self, _pkttype: int, _pktid: int,
-                       packet: SSHPacket) -> None:
+    async def _process_token(self, _pkttype: int, _pktid: int,
+                             packet: SSHPacket) -> None:
         """Process a GSS token from the server"""
 
         token: Optional[bytes] = packet.get_string()
@@ -235,7 +236,7 @@ class _ClientGSSMICAuth(ClientAuth):
         assert self._gss is not None
 
         try:
-            token = self._gss.step(token)
+            token = await run_in_executor(self._gss.step, token)
 
             if token:
                 self.send_packet(MSG_USERAUTH_GSSAPI_TOKEN, String(token))
@@ -246,7 +247,7 @@ class _ClientGSSMICAuth(ClientAuth):
             if exc.token:
                 self.send_packet(MSG_USERAUTH_GSSAPI_ERRTOK, String(exc.token))
 
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
 
     def _process_error(self, _pkttype: int, _pktid: int,
                        packet: SSHPacket) -> None:
@@ -261,8 +262,8 @@ class _ClientGSSMICAuth(ClientAuth):
         self.logger.debug1('GSS error from server: %s', msg)
         self._got_error = True
 
-    def _process_error_token(self, _pkttype: int, _pktid: int,
-                             packet: SSHPacket) -> None:
+    async def _process_error_token(self, _pkttype: int, _pktid: int,
+                                   packet: SSHPacket) -> None:
         """Process a GSS error token from the server"""
 
         token = packet.get_string()
@@ -271,7 +272,7 @@ class _ClientGSSMICAuth(ClientAuth):
         assert self._gss is not None
 
         try:
-            self._gss.step(token)
+            await run_in_executor(self._gss.step, token)
         except GSSError as exc:
             if not self._got_error: # pragma: no cover
                 self.logger.debug1('GSS error from server: %s', str(exc))
@@ -294,7 +295,7 @@ class _ClientHostBasedAuth(ClientAuth):
             await self._conn.host_based_auth_requested()
 
         if keypair is None:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
             return
 
         self.logger.debug1('Trying host based auth of user %s on host %s '
@@ -322,7 +323,7 @@ class _ClientPublicKeyAuth(ClientAuth):
         self._keypair = await self._conn.public_key_auth_requested()
 
         if self._keypair is None:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
             return
 
         self.logger.debug1('Trying public key auth with %s key',
@@ -340,10 +341,14 @@ class _ClientPublicKeyAuth(ClientAuth):
         self.logger.debug1('Signing request with %s key',
                            self._keypair.algorithm)
 
-        await self.send_request(Boolean(True),
-                                String(self._keypair.algorithm),
-                                String(self._keypair.public_data),
-                                key=self._keypair, trivial=False)
+        try:
+            await self.send_request(Boolean(True),
+                                    String(self._keypair.algorithm),
+                                    String(self._keypair.public_data),
+                                    key=self._keypair, trivial=False)
+        except ValueError as exc:
+            self.logger.debug1('Public key auth failed: %s', str(exc))
+            self._conn.try_next_auth()
 
     def _process_public_key_ok(self, _pkttype: int, _pktid: int,
                                packet: SSHPacket) -> None:
@@ -377,7 +382,7 @@ class _ClientKbdIntAuth(ClientAuth):
         submethods = await self._conn.kbdint_auth_requested()
 
         if submethods is None:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
             return
 
         self.logger.debug1('Trying keyboard-interactive auth')
@@ -393,7 +398,7 @@ class _ClientKbdIntAuth(ClientAuth):
                                                        lang, prompts)
 
         if responses is None:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
             return
 
         self.send_packet(MSG_USERAUTH_INFO_RESPONSE, UInt32(len(responses)),
@@ -454,7 +459,7 @@ class _ClientPasswordAuth(ClientAuth):
         password = await self._conn.password_auth_requested()
 
         if password is None:
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
             return
 
         self.logger.debug1('Trying password auth')
@@ -469,7 +474,7 @@ class _ClientPasswordAuth(ClientAuth):
 
         if result == NotImplemented:
             # Password change not supported - move on to the next auth method
-            self._conn.try_next_auth()
+            self._conn.try_next_auth(next_method=True)
             return
 
         self.logger.debug1('Trying to chsnge password')
@@ -543,10 +548,10 @@ class ServerAuth(Auth):
 
         self._conn.send_userauth_failure(partial_success)
 
-    def send_success(self) -> None:
+    async def send_success(self) -> None:
         """Send a user authentication success response"""
 
-        self._conn.send_userauth_success()
+        await self._conn.send_userauth_success()
 
 
 class _ServerNullAuth(ServerAuth):
@@ -591,7 +596,7 @@ class _ServerGSSKexAuth(ServerAuth):
                 (await self._conn.validate_gss_principal(self._username,
                                                          self._gss.user,
                                                          self._gss.host))):
-            self.send_success()
+            await self.send_success()
         else:
             self.send_failure()
 
@@ -635,6 +640,7 @@ class _ServerGSSMICAuth(ServerAuth):
             return
 
         self.logger.debug1('Trying GSS MIC auth')
+        self._gss.reset()
 
         self.send_packet(MSG_USERAUTH_GSSAPI_RESPONSE, String(match))
 
@@ -644,19 +650,19 @@ class _ServerGSSMICAuth(ServerAuth):
         if (await self._conn.validate_gss_principal(self._username,
                                                     self._gss.user,
                                                     self._gss.host)):
-            self.send_success()
+            await self.send_success()
         else:
             self.send_failure()
 
-    def _process_token(self, _pkttype: int, _pktid: int,
-                       packet: SSHPacket) -> None:
+    async def _process_token(self, _pkttype: int, _pktid: int,
+                             packet: SSHPacket) -> None:
         """Process a GSS token from the client"""
 
         token: Optional[bytes] = packet.get_string()
         packet.check_end()
 
         try:
-            token = self._gss.step(token)
+            token = await run_in_executor(self._gss.step, token)
 
             if token:
                 self.send_packet(MSG_USERAUTH_GSSAPI_TOKEN, String(token))
@@ -681,15 +687,15 @@ class _ServerGSSMICAuth(ServerAuth):
         else:
             self.send_failure()
 
-    def _process_error_token(self, _pkttype: int, _pktid: int,
-                             packet: SSHPacket) -> None:
+    async def _process_error_token(self, _pkttype: int, _pktid: int,
+                                   packet: SSHPacket) -> None:
         """Process a GSS error token from the client"""
 
         token = packet.get_string()
         packet.check_end()
 
         try:
-            self._gss.step(token)
+            await run_in_executor(self._gss.step, token)
         except GSSError as exc:
             self.logger.debug1('GSS error from client: %s', str(exc))
 
@@ -751,7 +757,7 @@ class _ServerHostBasedAuth(ServerAuth):
                                                       key_data, client_host,
                                                       client_username,
                                                       msg, signature)):
-            self.send_success()
+            await self.send_success()
         else:
             self.send_failure()
 
@@ -789,7 +795,7 @@ class _ServerPublicKeyAuth(ServerAuth):
         if (await self._conn.validate_public_key(self._username, key_data,
                                                  msg, signature)):
             if sig_present:
-                self.send_success()
+                await self.send_success()
             else:
                 self.send_packet(MSG_USERAUTH_PK_OK, String(algorithm),
                                  String(key_data))
@@ -826,9 +832,9 @@ class _ServerKbdIntAuth(ServerAuth):
 
         challenge = await self._conn.get_kbdint_challenge(self._username,
                                                           lang, submethods)
-        self._send_challenge(challenge)
+        await self._send_challenge(challenge)
 
-    def _send_challenge(self, challenge: KbdIntChallenge) -> None:
+    async def _send_challenge(self, challenge: KbdIntChallenge) -> None:
         """Send a keyboard interactive authentication request"""
 
         if isinstance(challenge, (tuple, list)):
@@ -842,7 +848,7 @@ class _ServerKbdIntAuth(ServerAuth):
                              String(instruction), String(lang),
                              UInt32(num_prompts), *prompts_bytes)
         elif challenge:
-            self.send_success()
+            await self.send_success()
         else:
             self.send_failure()
 
@@ -851,7 +857,7 @@ class _ServerKbdIntAuth(ServerAuth):
 
         next_challenge = \
             await self._conn.validate_kbdint_response(self._username, responses)
-        self._send_challenge(next_challenge)
+        await self._send_challenge(next_challenge)
 
     def _process_info_response(self, _pkttype: int, _pktid: int,
                                packet: SSHPacket) -> None:
@@ -916,7 +922,7 @@ class _ServerPasswordAuth(ServerAuth):
                     await self._conn.validate_password(self._username, password)
 
             if result:
-                self.send_success()
+                await self.send_success()
             else:
                 self.send_failure()
         except PasswordChangeRequired as exc:

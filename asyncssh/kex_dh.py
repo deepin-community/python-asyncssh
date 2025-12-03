@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2025 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -25,12 +25,13 @@ from typing import TYPE_CHECKING, Callable, Mapping, Optional, cast
 from typing_extensions import Protocol
 
 from .constants import DEFAULT_LANG
+from .crypto import Curve25519DH, Curve448DH, DH, ECDH, PQDH
 from .crypto import curve25519_available, curve448_available
-from .crypto import Curve25519DH, Curve448DH, ECDH
+from .crypto import mlkem_available, sntrup_available
 from .gss import GSSError
 from .kex import Kex, register_kex_alg, register_gss_kex_alg
 from .misc import HashType, KeyExchangeFailed, ProtocolError
-from .misc import get_symbol_names, randrange
+from .misc import get_symbol_names, run_in_executor
 from .packet import Boolean, MPInt, String, UInt32, SSHPacket
 from .public_key import SigningKey, VerifyingKey
 
@@ -46,6 +47,9 @@ class DHKey(Protocol):
 
     def get_public(self) -> bytes:
         """Return the public key to send to the peer"""
+
+    def get_shared_bytes(self, peer_public: bytes) -> bytes:
+        """Return the shared key from the peer's public key in bytes"""
 
     def get_shared(self, peer_public: bytes) -> int:
         """Return the shared key from the peer's public key"""
@@ -128,10 +132,9 @@ class _KexDHBase(Kex):
     def __init__(self, alg: bytes, conn: 'SSHConnection', hash_alg: HashType):
         super().__init__(alg, conn, hash_alg)
 
+        self._dh: Optional[DH] = None
         self._g = 0
         self._p = 0
-        self._q = 0
-        self._x = 0
         self._e = 0
         self._f = 0
         self._gex_data = b''
@@ -141,9 +144,8 @@ class _KexDHBase(Kex):
 
         self._g = g
         self._p = p
-        self._q = (p - 1) // 2
 
-    def _compute_hash(self, host_key_data: bytes, k: int) -> bytes:
+    def _compute_hash(self, host_key_data: bytes, k: bytes) -> bytes:
         """Compute a hash of key information associated with the connection"""
 
         hash_obj = self._hash_alg()
@@ -152,7 +154,7 @@ class _KexDHBase(Kex):
         hash_obj.update(self._gex_data)
         hash_obj.update(self._format_client_key())
         hash_obj.update(self._format_server_key())
-        hash_obj.update(MPInt(k))
+        hash_obj.update(k)
         return hash_obj.digest()
 
     def _parse_client_key(self, packet: SSHPacket) -> None:
@@ -195,42 +197,33 @@ class _KexDHBase(Kex):
     def _perform_init(self) -> None:
         """Compute e and send init message"""
 
-        self._x = randrange(2, self._q)
-        self._e = pow(self._g, self._x, self._p)
+        self._dh = DH(self._g, self._p)
+        self._e = self._dh.get_public()
 
         self._send_init()
 
-    def _compute_client_shared(self) -> int:
+    def _compute_client_shared(self) -> bytes:
         """Compute client shared key"""
 
         if not 1 <= self._f < self._p:
             raise ProtocolError('Kex DH f out of range')
 
-        k = pow(self._f, self._x, self._p)
+        assert self._dh is not None
+        return MPInt(self._dh.get_shared(self._f))
 
-        if k < 1: # pragma: no cover, shouldn't be possible with valid p
-            raise ProtocolError('Kex DH k out of range')
-
-        return k
-
-    def _compute_server_shared(self) -> int:
+    def _compute_server_shared(self) -> bytes:
         """Compute server shared key"""
 
         if not 1 <= self._e < self._p:
             raise ProtocolError('Kex DH e out of range')
 
-        y = randrange(2, self._q)
-        self._f = pow(self._g, y, self._p)
+        self._dh = DH(self._g, self._p)
+        self._f = self._dh.get_public()
 
-        k = pow(self._e, y, self._p)
-
-        if k < 1: # pragma: no cover, shouldn't be possible with valid p
-            raise ProtocolError('Kex DH k out of range')
-
-        return k
+        return MPInt(self._dh.get_shared(self._e))
 
     def _perform_reply(self, key: SigningKey, key_data: bytes) -> None:
-        """Compute f and send reply message"""
+        """Compute server shared key and send reply message"""
 
         k = self._compute_server_shared()
         h = self._compute_hash(key_data, k)
@@ -282,7 +275,7 @@ class _KexDHBase(Kex):
         host_key = client_conn.validate_server_host_key(host_key_data)
         self._verify_reply(host_key, host_key_data, sig)
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start DH key exchange"""
 
         if self._conn.is_client():
@@ -350,6 +343,9 @@ class _KexDHGex(_KexDHBase):
         if self._conn.is_client():
             raise ProtocolError('Unexpected kex request msg')
 
+        if self._p:
+            raise ProtocolError('Kex DH group already requested')
+
         self._gex_data = packet.get_remaining_payload()
 
         if pkttype == MSG_KEX_DH_GEX_REQUEST_OLD:
@@ -384,6 +380,9 @@ class _KexDHGex(_KexDHBase):
         if self._conn.is_server():
             raise ProtocolError('Unexpected kex group msg')
 
+        if self._p:
+            raise ProtocolError('Kex DH group already sent')
+
         p = packet.get_mpint()
         g = packet.get_mpint()
         packet.check_end()
@@ -392,7 +391,7 @@ class _KexDHGex(_KexDHBase):
         self._gex_data += MPInt(p) + MPInt(g)
         self._perform_init()
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start DH group exchange"""
 
         if self._conn.is_client():
@@ -447,23 +446,23 @@ class _KexECDH(_KexDHBase):
 
         return String(self._server_pub)
 
-    def _compute_client_shared(self) -> int:
+    def _compute_client_shared(self) -> bytes:
         """Compute client shared key"""
 
         try:
-            return self._priv.get_shared(self._server_pub)
+            return MPInt(self._priv.get_shared(self._server_pub))
         except ValueError:
             raise ProtocolError('Invalid ECDH server public key') from None
 
-    def _compute_server_shared(self) -> int:
+    def _compute_server_shared(self) -> bytes:
         """Compute server shared key"""
 
         try:
-            return self._priv.get_shared(self._client_pub)
+            return MPInt(self._priv.get_shared(self._client_pub))
         except ValueError:
             raise ProtocolError('Invalid ECDH client public key') from None
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start ECDH key exchange"""
 
         if self._conn.is_client():
@@ -475,6 +474,58 @@ class _KexECDH(_KexDHBase):
     }
 
 
+class _KexHybridECDH(_KexECDH):
+    """Handler for post-quantum key exchange"""
+
+    def __init__(self, alg: bytes, conn: 'SSHConnection', hash_alg: HashType,
+                 pq_alg_name: bytes, ecdh_class: _ECDHClass, *args: object):
+        super().__init__(alg, conn, hash_alg, ecdh_class, *args)
+
+        self._pq = PQDH(pq_alg_name)
+
+        if conn.is_client():
+            pq_pub, self._pq_priv = self._pq.keypair()
+            self._client_pub = pq_pub + self._client_pub
+
+    def _compute_client_shared(self) -> bytes:
+        """Compute client shared key"""
+
+        pq_ciphertext = self._server_pub[:self._pq.ciphertext_bytes]
+        ec_pub = self._server_pub[self._pq.ciphertext_bytes:]
+
+        try:
+            pq_secret = self._pq.decaps(pq_ciphertext, self._pq_priv)
+        except ValueError:
+            raise ProtocolError('Invalid PQ server ciphertext') from None
+
+        try:
+            ec_shared = self._priv.get_shared_bytes(ec_pub)
+        except ValueError:
+            raise ProtocolError('Invalid ECDH server public key') from None
+
+        return String(self._hash_alg(pq_secret + ec_shared).digest())
+
+    def _compute_server_shared(self) -> bytes:
+        """Compute server shared key"""
+
+        pq_pub = self._client_pub[:self._pq.pubkey_bytes]
+        ec_pub = self._client_pub[self._pq.pubkey_bytes:]
+
+        try:
+            pq_secret, pq_ciphertext = self._pq.encaps(pq_pub)
+        except ValueError:
+            raise ProtocolError('Invalid PQ client public key') from None
+
+        try:
+            ec_shared = self._priv.get_shared_bytes(ec_pub)
+        except ValueError:
+            raise ProtocolError('Invalid ECDH client public key') from None
+
+        self._server_pub = pq_ciphertext + self._server_pub
+
+        return String(self._hash_alg(pq_secret + ec_shared).digest())
+
+
 class _KexGSSBase(_KexDHBase):
     """Handler for GSS key exchange"""
 
@@ -484,6 +535,7 @@ class _KexGSSBase(_KexDHBase):
 
         self._gss = conn.get_gss_context()
         self._token: Optional[bytes] = None
+        self._host_key_msg_ok = False
         self._host_key_data = b''
 
     def _check_secure(self) -> None:
@@ -521,11 +573,11 @@ class _KexGSSBase(_KexDHBase):
 
         self.send_packet(MSG_KEXGSS_CONTINUE, String(self._token))
 
-    def _process_token(self, token: Optional[bytes] = None) -> None:
+    async def _process_token(self, token: Optional[bytes] = None) -> None:
         """Process a GSS token"""
 
         try:
-            self._token = self._gss.step(token)
+            self._token = await run_in_executor(self._gss.step, token)
         except GSSError as exc:
             if self._conn.is_server():
                 self.send_packet(MSG_KEXGSS_ERROR, UInt32(exc.maj_code),
@@ -537,8 +589,8 @@ class _KexGSSBase(_KexDHBase):
 
             raise KeyExchangeFailed(str(exc)) from None
 
-    def _process_init(self, _pkttype: int, _pktid: int,
-                      packet: SSHPacket) -> None:
+    async def _process_gss_init(self, _pkttype: int, _pktid: int,
+                                packet: SSHPacket) -> None:
         """Process a GSS init message"""
 
         if self._conn.is_client():
@@ -557,7 +609,7 @@ class _KexGSSBase(_KexDHBase):
         else:
             self._host_key_data = b''
 
-        self._process_token(token)
+        await self._process_token(token)
 
         if self._gss.complete:
             self._check_secure()
@@ -566,8 +618,8 @@ class _KexGSSBase(_KexDHBase):
         else:
             self._send_continue()
 
-    def _process_continue(self, _pkttype: int, _pktid: int,
-                          packet: SSHPacket) -> None:
+    async def _process_continue(self, _pkttype: int, _pktid: int,
+                                packet: SSHPacket) -> None:
         """Process a GSS continue message"""
 
         token = packet.get_string()
@@ -576,7 +628,9 @@ class _KexGSSBase(_KexDHBase):
         if self._conn.is_client() and self._gss.complete:
             raise ProtocolError('Unexpected kexgss continue msg')
 
-        self._process_token(token)
+        self._host_key_msg_ok = False
+
+        await self._process_token(token)
 
         if self._conn.is_server() and self._gss.complete:
             self._check_secure()
@@ -584,12 +638,14 @@ class _KexGSSBase(_KexDHBase):
         else:
             self._send_continue()
 
-    def _process_complete(self, _pkttype: int, _pktid: int,
-                          packet: SSHPacket) -> None:
+    async def _process_complete(self, _pkttype: int, _pktid: int,
+                                packet: SSHPacket) -> None:
         """Process a GSS complete message"""
 
         if self._conn.is_server():
             raise ProtocolError('Unexpected kexgss complete msg')
+
+        self._host_key_msg_ok = False
 
         self._parse_server_key(packet)
         mic = packet.get_string()
@@ -601,7 +657,7 @@ class _KexGSSBase(_KexDHBase):
             if self._gss.complete:
                 raise ProtocolError('Non-empty token after complete')
 
-            self._process_token(token)
+            await self._process_token(token)
 
             if self._token:
                 raise ProtocolError('Non-empty token after complete')
@@ -617,6 +673,10 @@ class _KexGSSBase(_KexDHBase):
                          packet: SSHPacket) -> None:
         """Process a GSS hostkey message"""
 
+        if not self._host_key_msg_ok:
+            raise ProtocolError('Unexpected kexgss hostkey msg')
+
+        self._host_key_msg_ok = False
         self._host_key_data = packet.get_string()
         packet.check_end()
 
@@ -636,12 +696,13 @@ class _KexGSSBase(_KexDHBase):
         self._conn.logger.debug1('GSS error: %s',
                                  msg.decode('utf-8', errors='ignore'))
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start GSS key exchange"""
 
         if self._conn.is_client():
-            self._process_token()
-            super().start()
+            self._host_key_msg_ok = True
+            await self._process_token()
+            await super().start()
 
 
 class _KexGSS(_KexGSSBase, _KexDH):
@@ -650,7 +711,7 @@ class _KexGSS(_KexGSSBase, _KexDH):
     _handler_names = get_symbol_names(globals(), 'MSG_KEXGSS_')
 
     _packet_handlers = {
-        MSG_KEXGSS_INIT:     _KexGSSBase._process_init,
+        MSG_KEXGSS_INIT:     _KexGSSBase._process_gss_init,
         MSG_KEXGSS_CONTINUE: _KexGSSBase._process_continue,
         MSG_KEXGSS_COMPLETE: _KexGSSBase._process_complete,
         MSG_KEXGSS_HOSTKEY:  _KexGSSBase._process_hostkey,
@@ -667,7 +728,7 @@ class _KexGSSGex(_KexGSSBase, _KexDHGex):
     _group_type = MSG_KEXGSS_GROUP
 
     _packet_handlers = {
-        MSG_KEXGSS_INIT:     _KexGSSBase._process_init,
+        MSG_KEXGSS_INIT:     _KexGSSBase._process_gss_init,
         MSG_KEXGSS_CONTINUE: _KexGSSBase._process_continue,
         MSG_KEXGSS_COMPLETE: _KexGSSBase._process_complete,
         MSG_KEXGSS_HOSTKEY:  _KexGSSBase._process_hostkey,
@@ -683,7 +744,7 @@ class _KexGSSECDH(_KexGSSBase, _KexECDH):
     _handler_names = get_symbol_names(globals(), 'MSG_KEXGSS_')
 
     _packet_handlers = {
-        MSG_KEXGSS_INIT:     _KexGSSBase._process_init,
+        MSG_KEXGSS_INIT:     _KexGSSBase._process_gss_init,
         MSG_KEXGSS_CONTINUE: _KexGSSBase._process_continue,
         MSG_KEXGSS_COMPLETE: _KexGSSBase._process_complete,
         MSG_KEXGSS_HOSTKEY:  _KexGSSBase._process_hostkey,
@@ -691,7 +752,23 @@ class _KexGSSECDH(_KexGSSBase, _KexECDH):
     }
 
 
+if mlkem_available: # pragma: no branch
+    if curve25519_available: # pragma: no branch
+        register_kex_alg(b'mlkem768x25519-sha256', _KexHybridECDH,
+                         sha256, (b'mlkem768', Curve25519DH), True)
+
+    register_kex_alg(b'mlkem768nistp256-sha256', _KexHybridECDH,
+                     sha256, (b'mlkem768', ECDH, b'nistp256'), True)
+    register_kex_alg(b'mlkem1024nistp384-sha384', _KexHybridECDH,
+                     sha384, (b'mlkem1024', ECDH, b'nistp384'), True)
+
 if curve25519_available: # pragma: no branch
+    if sntrup_available: # pragma: no branch
+        register_kex_alg(b'sntrup761x25519-sha512', _KexHybridECDH,
+                         sha512, (b'sntrup761', Curve25519DH), True)
+        register_kex_alg(b'sntrup761x25519-sha512@openssh.com', _KexHybridECDH,
+                         sha512, (b'sntrup761', Curve25519DH), True)
+
     register_kex_alg(b'curve25519-sha256', _KexECDH, sha256,
                      (Curve25519DH,), True)
     register_kex_alg(b'curve25519-sha256@libssh.org', _KexECDH, sha256,

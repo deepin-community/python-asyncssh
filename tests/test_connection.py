@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2016-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -25,17 +25,18 @@ from copy import copy
 import os
 from pathlib import Path
 import socket
-import subprocess
 import sys
 import unittest
 from unittest.mock import patch
 
 import asyncssh
-from asyncssh.constants import MSG_UNIMPLEMENTED, MSG_DEBUG
+from asyncssh.constants import MSG_IGNORE, MSG_DEBUG
 from asyncssh.constants import MSG_SERVICE_REQUEST, MSG_SERVICE_ACCEPT
 from asyncssh.constants import MSG_KEXINIT, MSG_NEWKEYS
+from asyncssh.constants import MSG_KEX_FIRST, MSG_KEX_LAST
 from asyncssh.constants import MSG_USERAUTH_REQUEST, MSG_USERAUTH_SUCCESS
 from asyncssh.constants import MSG_USERAUTH_FAILURE, MSG_USERAUTH_BANNER
+from asyncssh.constants import MSG_USERAUTH_FIRST
 from asyncssh.constants import MSG_GLOBAL_REQUEST
 from asyncssh.constants import MSG_CHANNEL_OPEN, MSG_CHANNEL_OPEN_CONFIRMATION
 from asyncssh.constants import MSG_CHANNEL_OPEN_FAILURE, MSG_CHANNEL_DATA
@@ -43,23 +44,18 @@ from asyncssh.compression import get_compression_algs
 from asyncssh.crypto.cipher import GCMCipher
 from asyncssh.encryption import get_encryption_algs
 from asyncssh.kex import get_kex_algs
+from asyncssh.kex_dh import MSG_KEX_ECDH_REPLY
 from asyncssh.mac import _HMAC, _mac_handler, get_mac_algs
-from asyncssh.packet import Boolean, NameList, String, UInt32
+from asyncssh.packet import SSHPacket, Boolean, NameList, String, UInt32
 from asyncssh.public_key import get_default_public_key_algs
 from asyncssh.public_key import get_default_certificate_algs
 from asyncssh.public_key import get_default_x509_certificate_algs
 
 from .server import Server, ServerTestCase
 
-from .util import asynctest, gss_available, patch_gss, run
-from .util import patch_getnameinfo, x509_available
-
-
-try:
-    run('which nc')
-    _nc_available = True
-except subprocess.CalledProcessError: # pragma: no cover
-    _nc_available = False
+from .util import asynctest, patch_extra_kex, patch_getaddrinfo
+from .util import patch_getnameinfo, patch_gss
+from .util import gss_available, nc_available, x509_available
 
 
 class _CheckAlgsClientConnection(asyncssh.SSHClientConnection):
@@ -178,6 +174,27 @@ class _ExtInfoServerConnection(asyncssh.SSHServerConnection):
         super()._send_ext_info()
 
 
+class _BadSignatureServerConnection(asyncssh.SSHServerConnection):
+    """Test returning a bad signature in host keys prove request"""
+
+    def _process_hostkeys_prove_00_at_openssh_dot_com_global_request(
+            self, packet):
+        """Prove the server has private keys for all requested host keys"""
+
+        self._report_global_response(String(b''))
+
+
+class _ProveFailedServerConnection(asyncssh.SSHServerConnection):
+    """Test returning failure in host keys prove request"""
+
+    def _process_hostkeys_prove_00_at_openssh_dot_com_global_request(
+            self, packet):
+        """Prove the server has private keys for all requested host keys"""
+
+        super()._process_hostkeys_prove_00_at_openssh_dot_com_global_request(
+                SSHPacket(String(b'')))
+
+
 def _failing_get_mac(alg, key):
     """Replace HMAC class with FailingMAC"""
 
@@ -191,6 +208,12 @@ def _failing_get_mac(alg, key):
 
     _, hash_size, args = _mac_handler[alg]
     return _FailingMAC(key, hash_size, *args)
+
+
+async def _slow_connect(*_args, **_kwargs):
+    """Simulate a really slow connect that ends up timing out"""
+
+    await asyncio.sleep(5)
 
 
 class _FailingGCMCipher(GCMCipher):
@@ -257,6 +280,17 @@ class _InternalErrorClient(asyncssh.SSHClient):
         # pylint: disable=unused-argument
 
         raise RuntimeError('Exception handler test')
+
+
+class _ClientCleanupError(asyncssh.SSHClient):
+    """Test of exception during client cleanup"""
+
+    def connection_lost(self, exc):
+        """Raise an error when a client is cleaned up"""
+
+        # pylint: disable=unused-argument
+
+        raise RuntimeError('Exception in cleanup test')
 
 
 class _TunnelServer(Server):
@@ -339,14 +373,6 @@ class _VersionReportingServer(Server):
         return False
 
 
-def disconnect_on_unimplemented(self, pkttype, pktid, packet):
-    """Process an unimplemented message response"""
-
-    # pylint: disable=unused-argument
-
-    self.disconnect(asyncssh.DISC_BY_APPLICATION, 'Unexpected response')
-
-
 @patch_gss
 @patch('asyncssh.connection.SSHClientConnection', _CheckAlgsClientConnection)
 class _TestConnection(ServerTestCase):
@@ -388,8 +414,70 @@ class _TestConnection(ServerTestCase):
     async def test_connect(self):
         """Test connecting with async context manager"""
 
-        async with self.connect():
+        async with self.connect() as conn:
             pass
+
+        self.assertTrue(conn.is_closed())
+
+    @asynctest
+    async def test_connect_sock(self):
+        """Test connecting using an already-connected socket"""
+
+        sock = socket.socket()
+        await self.loop.sock_connect(sock, (self._server_addr,
+                                            self._server_port))
+
+        async with asyncssh.connect(sock=sock):
+            pass
+
+    @unittest.skipUnless(nc_available, 'Netcat not available')
+    @asynctest
+    async def test_connect_non_tcp_sock(self):
+        """Test connecting using an non-TCP socket"""
+
+        sock1, sock2 = socket.socketpair()
+
+        proc = await asyncio.create_subprocess_exec(
+            'nc', str(self._server_addr), str(self._server_port),
+            stdin=sock1, stdout=sock1, stderr=sock1)
+
+        async with asyncssh.connect(
+                self._server_addr, self._server_port, sock=sock2):
+            pass
+
+        await proc.wait()
+        sock1.close()
+
+    @asynctest
+    async def test_run_client(self):
+        """Test running an SSH client on an already-connected socket"""
+
+        sock = socket.socket()
+        await self.loop.sock_connect(sock, (self._server_addr,
+                                            self._server_port))
+
+        async with self.run_client(sock):
+            pass
+
+    @asynctest
+    async def test_connect_encrypted_key(self):
+        """Test connecting with encrypted client key and no passphrase"""
+
+        async with self.connect(client_keys='ckey_encrypted',
+                                ignore_encrypted=True):
+            pass
+
+        with self.assertRaises(asyncssh.KeyImportError):
+            await self.connect(client_keys='ckey_encrypted')
+
+        with open('config', 'w') as f:
+            f.write('IdentityFile ckey_encrypted')
+
+        async with self.connect(config='config'):
+            pass
+
+        with self.assertRaises(asyncssh.KeyImportError):
+            await self.connect(config='config', ignore_encrypted=False)
 
     @asynctest
     async def test_connect_invalid_options_type(self):
@@ -426,22 +514,28 @@ class _TestConnection(ServerTestCase):
         """Test connect timeout exceeded"""
 
         with self.assertRaises(asyncio.TimeoutError):
-            await asyncssh.connect('223.255.255.254', connect_timeout=1)
+            with patch('asyncio.BaseEventLoop.create_connection',
+                       _slow_connect):
+                await asyncssh.connect('', connect_timeout=1)
 
     @asynctest
     async def test_connect_timeout_exceeded_string(self):
         """Test connect timeout exceeded with string value"""
 
         with self.assertRaises(asyncio.TimeoutError):
-            await asyncssh.connect('223.255.255.254', connect_timeout='0m1s')
+            with patch('asyncio.BaseEventLoop.create_connection',
+                       _slow_connect):
+                await asyncssh.connect('', connect_timeout='0m1s')
 
     @asynctest
     async def test_connect_timeout_exceeded_tunnel(self):
         """Test connect timeout exceeded"""
 
         with self.assertRaises(asyncio.TimeoutError):
-            await asyncssh.listen(server_host_keys=['skey'],
-                                  tunnel='223.255.255.254', connect_timeout=1)
+            with patch('asyncio.BaseEventLoop.create_connection',
+                       _slow_connect):
+                await asyncssh.listen(server_host_keys=['skey'],
+                                      tunnel='', connect_timeout=1)
 
     @asynctest
     async def test_invalid_connect_timeout(self):
@@ -530,6 +624,14 @@ class _TestConnection(ServerTestCase):
             await asyncssh.listen(server_host_keys=['skey', 'skey'])
 
     @asynctest
+    async def test_reserved_server_host_keys(self):
+        """Test reserved host keys with host key sending enabled"""
+
+        async with self.listen(server_host_keys=['skey', 'skey'],
+                               send_server_host_keys=True):
+            pass
+
+    @asynctest
     async def test_get_server_host_key(self):
         """Test retrieving a server host key"""
 
@@ -555,7 +657,7 @@ class _TestConnection(ServerTestCase):
         with self.assertRaises(OSError):
             await asyncssh.get_server_host_key('\xff')
 
-    @unittest.skipUnless(_nc_available, 'Netcat not available')
+    @unittest.skipUnless(nc_available, 'Netcat not available')
     @asynctest
     async def test_get_server_host_key_proxy(self):
         """Test retrieving a server host key using proxy command"""
@@ -567,12 +669,12 @@ class _TestConnection(ServerTestCase):
 
         self.assertEqual(key, keylist[0])
 
-    @unittest.skipUnless(_nc_available, 'Netcat not available')
+    @unittest.skipUnless(nc_available, 'Netcat not available')
     @asynctest
     async def test_get_server_host_key_proxy_failure(self):
         """Test failure retrieving a server host key using proxy command"""
 
-        # Leave out arguments to 'nc' to trigger a faliure
+        # Leave out arguments to 'nc' to trigger a failure
         proxy_command = 'nc'
 
         with self.assertRaises((OSError, asyncssh.ConnectionLost)):
@@ -615,6 +717,16 @@ class _TestConnection(ServerTestCase):
 
         async with self.connect(known_hosts=None) as conn:
             self.assertEqual(conn.get_server_host_key_algs(), default_algs)
+
+    @asynctest
+    async def test_known_hosts_none_in_config(self):
+        """Test connecting with known hosts checking disabled in config file"""
+
+        with open('config', 'w') as f:
+            f.write('UserKnownHostsFile none')
+
+        async with self.connect(config='config'):
+            pass
 
     @asynctest
     async def test_known_hosts_none_without_x509(self):
@@ -698,7 +810,7 @@ class _TestConnection(ServerTestCase):
 
         known_hosts_path = os.path.join('.ssh', 'known_hosts')
 
-        with open(known_hosts_path, 'r') as f:
+        with open(known_hosts_path) as f:
             known_hosts = asyncssh.import_known_hosts(f.read())
 
         async with self.connect(known_hosts=known_hosts):
@@ -812,7 +924,7 @@ class _TestConnection(ServerTestCase):
 
     @asynctest
     async def test_duplicate_encryption_algs(self):
-        """Test connecting with an duplicated encryption algorithm"""
+        """Test connecting with a duplicated encryption algorithm"""
 
         with patch('asyncssh.connection.SSHClientConnection',
                    _CheckAlgsClientConnection):
@@ -892,22 +1004,6 @@ class _TestConnection(ServerTestCase):
                 await self.connect(kex_algs=['fail'])
 
     @asynctest
-    async def test_skip_ext_info(self):
-        """Test not requesting extension info from the server"""
-
-        def skip_ext_info(self):
-            """Don't request extension information"""
-
-            # pylint: disable=unused-argument
-
-            return []
-
-        with patch('asyncssh.connection.SSHConnection._get_ext_info_kex_alg',
-                   skip_ext_info):
-            async with self.connect():
-                pass
-
-    @asynctest
     async def test_unknown_ext_info(self):
         """Test receiving unknown extension information"""
 
@@ -928,8 +1024,56 @@ class _TestConnection(ServerTestCase):
 
         with patch('asyncssh.connection.SSHClientConnection.send_newkeys',
                    send_newkeys):
-            async with self.connect():
-                pass
+            with self.assertRaises((ConnectionError, asyncssh.ProtocolError)):
+                await self.connect()
+
+    @asynctest
+    async def test_message_before_kexinit_strict_kex(self):
+        """Test receiving a message before KEXINIT with strict_kex enabled"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            if pkttype == MSG_KEXINIT:
+                self.send_packet(MSG_IGNORE, String(b''))
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+        with patch('asyncssh.connection.SSHClientConnection.send_packet',
+                   send_packet):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
+
+    @asynctest
+    async def test_message_during_kex_strict_kex(self):
+        """Test receiving an unexpected message with strict_kex enabled"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            if pkttype == MSG_KEX_ECDH_REPLY:
+                self.send_packet(MSG_IGNORE, String(b''))
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+        with patch('asyncssh.connection.SSHServerConnection.send_packet',
+                   send_packet):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
+
+    @asynctest
+    async def test_unknown_message_during_kex_strict_kex(self):
+        """Test receiving an unknown message with strict_kex enabled"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            if pkttype == MSG_KEX_ECDH_REPLY:
+                self.send_packet(MSG_KEX_LAST)
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+        with patch('asyncssh.connection.SSHServerConnection.send_packet',
+                   send_packet):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
 
     @asynctest
     async def test_encryption_algs(self):
@@ -1055,20 +1199,106 @@ class _TestConnection(ServerTestCase):
         await conn.wait_closed()
 
     @asynctest
-    async def test_invalid_service_request(self):
-        """Test invalid service request"""
+    async def test_service_request_before_kex_complete(self):
+        """Test service request before kex is complete"""
+
+        def send_newkeys(self, k, h):
+            """Finish a key exchange and send a new keys message"""
+
+            self._kex_complete = True
+
+            self.send_packet(MSG_SERVICE_REQUEST, String('ssh-userauth'))
+
+            asyncssh.connection.SSHConnection.send_newkeys(self, k, h)
+
+        with patch('asyncssh.connection.SSHClientConnection.send_newkeys',
+                   send_newkeys):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
+
+    @asynctest
+    async def test_service_accept_before_kex_complete(self):
+        """Test service accept before kex is complete"""
+
+        def send_newkeys(self, k, h):
+            """Finish a key exchange and send a new keys message"""
+
+            self._kex_complete = True
+
+            self.send_packet(MSG_SERVICE_ACCEPT, String('ssh-userauth'))
+
+            asyncssh.connection.SSHConnection.send_newkeys(self, k, h)
+
+        with patch('asyncssh.connection.SSHServerConnection.send_newkeys',
+                   send_newkeys):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
+
+    @asynctest
+    async def test_unexpected_service_name_in_request(self):
+        """Test unexpected service name in service request"""
 
         conn = await self.connect()
         conn.send_packet(MSG_SERVICE_REQUEST, String('xxx'))
         await conn.wait_closed()
 
     @asynctest
-    async def test_invalid_service_accept(self):
-        """Test invalid service accept"""
+    async def test_unexpected_service_name_in_accept(self):
+        """Test unexpected service name in accept sent by server"""
+
+        def send_newkeys(self, k, h):
+            """Finish a key exchange and send a new keys message"""
+
+            asyncssh.connection.SSHConnection.send_newkeys(self, k, h)
+
+            self.send_packet(MSG_SERVICE_ACCEPT, String('xxx'))
+
+        with patch('asyncssh.connection.SSHServerConnection.send_newkeys',
+                   send_newkeys):
+            with self.assertRaises(asyncssh.ServiceNotAvailable):
+                await self.connect()
+
+    @asynctest
+    async def test_service_accept_from_client(self):
+        """Test service accept sent by client"""
 
         conn = await self.connect()
-        conn.send_packet(MSG_SERVICE_ACCEPT, String('xxx'))
+        conn.send_packet(MSG_SERVICE_ACCEPT, String('ssh-userauth'))
         await conn.wait_closed()
+
+    @asynctest
+    async def test_service_request_from_server(self):
+        """Test service request sent by server"""
+
+        def send_newkeys(self, k, h):
+            """Finish a key exchange and send a new keys message"""
+
+            asyncssh.connection.SSHConnection.send_newkeys(self, k, h)
+
+            self.send_packet(MSG_SERVICE_REQUEST, String('ssh-userauth'))
+
+        with patch('asyncssh.connection.SSHServerConnection.send_newkeys',
+                   send_newkeys):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
+
+    @asynctest
+    async def test_client_decompression_failure(self):
+        """Test client decompression failure"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            """Send an SSH packet"""
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+            if pkttype == MSG_USERAUTH_SUCCESS:
+                self._compressor = None
+                self.send_debug('Test')
+
+        with patch('asyncssh.connection.SSHServerConnection.send_packet',
+                   send_packet):
+            await self.connect(compression_algs=['zlib@openssh.com'])
 
     @asynctest
     async def test_packet_decode_error(self):
@@ -1277,6 +1507,41 @@ class _TestConnection(ServerTestCase):
         await conn.wait_closed()
 
     @asynctest
+    async def test_kex_after_kex_complete(self):
+        """Test kex request when kex not in progress"""
+
+        conn = await self.connect()
+        conn.send_packet(MSG_KEX_FIRST)
+        await conn.wait_closed()
+
+    @asynctest
+    async def test_userauth_after_auth_complete(self):
+        """Test userauth request when auth not in progress"""
+
+        conn = await self.connect()
+        conn.send_packet(MSG_USERAUTH_FIRST)
+        await conn.wait_closed()
+
+    @asynctest
+    async def test_userauth_before_kex_complete(self):
+        """Test receiving userauth before kex is complete"""
+
+        def send_newkeys(self, k, h):
+            """Finish a key exchange and send a new keys message"""
+
+            self._kex_complete = True
+
+            self.send_packet(MSG_USERAUTH_REQUEST, String('guest'),
+                             String('ssh-connection'), String('none'))
+
+            asyncssh.connection.SSHConnection.send_newkeys(self, k, h)
+
+        with patch('asyncssh.connection.SSHClientConnection.send_newkeys',
+                   send_newkeys):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect()
+
+    @asynctest
     async def test_invalid_userauth_service(self):
         """Test invalid service in userauth request"""
 
@@ -1326,24 +1591,31 @@ class _TestConnection(ServerTestCase):
             await asyncio.sleep(0.1)
 
     @asynctest
+    async def test_late_userauth_request(self):
+        """Test userauth request after auth is final"""
+
+        async with self.connect() as conn:
+            conn.send_packet(MSG_GLOBAL_REQUEST, String('xxx'),
+                             Boolean(False))
+            conn.send_packet(MSG_USERAUTH_REQUEST, String('guest'),
+                             String('ssh-connection'), String('none'))
+            await conn.wait_closed()
+
+    @asynctest
     async def test_unexpected_userauth_success(self):
         """Test unexpected userauth success response"""
 
-        with patch.dict('asyncssh.connection.SSHConnection._packet_handlers',
-                        {MSG_UNIMPLEMENTED: disconnect_on_unimplemented}):
-            conn = await self.connect()
-            conn.send_packet(MSG_USERAUTH_SUCCESS)
-            await conn.wait_closed()
+        conn = await self.connect()
+        conn.send_packet(MSG_USERAUTH_SUCCESS)
+        await conn.wait_closed()
 
     @asynctest
     async def test_unexpected_userauth_failure(self):
         """Test unexpected userauth failure response"""
 
-        with patch.dict('asyncssh.connection.SSHConnection._packet_handlers',
-                        {MSG_UNIMPLEMENTED: disconnect_on_unimplemented}):
-            conn = await self.connect()
-            conn.send_packet(MSG_USERAUTH_FAILURE, NameList([]), Boolean(False))
-            await conn.wait_closed()
+        conn = await self.connect()
+        conn.send_packet(MSG_USERAUTH_FAILURE, NameList([]), Boolean(False))
+        await conn.wait_closed()
 
     @asynctest
     async def test_unexpected_userauth_banner(self):
@@ -1458,6 +1730,210 @@ class _TestConnection(ServerTestCase):
         with self.assertRaises(RuntimeError):
             await self.create_connection(_InternalErrorClient)
 
+    @asynctest
+    async def test_client_cleanup_error(self):
+        """Test error in client cleanup"""
+
+        async with self.connect(client_factory=_ClientCleanupError):
+            pass
+
+
+@patch_extra_kex
+class _TestConnectionNoStrictKex(ServerTestCase):
+    """Unit tests for connection API with ext info and strict kex disabled"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server to connect to"""
+
+        return (await cls.create_server(_TunnelServer, gss_host=(),
+                                        compression_algs='*',
+                                        encryption_algs='*',
+                                        kex_algs='*', mac_algs='*'))
+
+    @asynctest
+    async def test_skip_ext_info(self):
+        """Test not requesting extension info from the server"""
+
+        async with self.connect():
+            pass
+
+    @asynctest
+    async def test_message_before_kexinit(self):
+        """Test receiving a message before KEXINIT"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            if pkttype == MSG_KEXINIT:
+                self.send_packet(MSG_IGNORE, String(b''))
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+        with patch('asyncssh.connection.SSHClientConnection.send_packet',
+                   send_packet):
+            async with self.connect():
+                pass
+
+    @asynctest
+    async def test_message_during_kex(self):
+        """Test receiving an unexpected message in key exchange"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            if pkttype == MSG_KEX_ECDH_REPLY:
+                self.send_packet(MSG_IGNORE, String(b''))
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+        with patch('asyncssh.connection.SSHServerConnection.send_packet',
+                   send_packet):
+            async with self.connect():
+                pass
+
+    @asynctest
+    async def test_sequence_wrap_during_kex(self):
+        """Test sequence wrap during initial key exchange"""
+
+        def send_packet(self, pkttype, *args, **kwargs):
+            if pkttype == MSG_KEXINIT:
+                if self._options.command == 'send':
+                    self._send_seq = 0xfffffffe
+                else:
+                    self._recv_seq = 0xfffffffe
+
+            asyncssh.connection.SSHConnection.send_packet(
+                self, pkttype, *args, **kwargs)
+
+        with patch('asyncssh.connection.SSHClientConnection.send_packet',
+                   send_packet):
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect(command='send')
+
+            with self.assertRaises(asyncssh.ProtocolError):
+                await self.connect(command='recv')
+
+
+class _TestConnectionHostKeysHandler(ServerTestCase):
+    """Unit test for specifying a host keys handler"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server to connect to"""
+
+        return (await cls.create_server(
+            server_host_keys=['skey', 'skey_ecdsa'],
+            send_server_host_keys=True))
+
+    async def _check_host_keys(self, host_keys, known_hosts, expected):
+        """Check server host keys handler"""
+
+        def host_keys_handler(*results):
+            """Check reported host keys against expected value"""
+
+            self.assertEqual([len(r) for r in results], expected)
+            conn.close()
+
+        async def async_host_keys_handler(*results):
+            """Check async version of server host keys handler"""
+
+            host_keys_handler(*results)
+
+        self._server.update(server_host_keys=host_keys)
+
+        conn = await self.connect(server_host_keys_handler=host_keys_handler,
+                                  known_hosts=known_hosts)
+
+        if expected is None:
+            await asyncio.sleep(0.1)
+            conn.close()
+
+        await conn.wait_closed()
+
+        if expected:
+            conn = await self.connect(
+                server_host_keys_handler=async_host_keys_handler,
+                known_hosts=known_hosts)
+
+            await conn.wait_closed()
+
+
+    @asynctest
+    async def test_host_key_handler_disabled(self):
+        """Test server host keys handler being disabled"""
+
+        async with self.connect():
+            await asyncio.sleep(0.1)
+
+    @asynctest
+    async def test_host_key_added(self):
+        """Test server host keys handler showing a key added"""
+
+        await self._check_host_keys(['skey', 'skey_ecdsa'],
+                                    [['skey'], [], []],
+                                    [1, 0, 1, 0])
+
+    @asynctest
+    async def test_host_key_removed(self):
+        """Test server host keys handler showing a key removed"""
+
+        await self._check_host_keys(['skey'], [['skey', 'skey_ecdsa'], [], []],
+                                    [0, 1, 1, 0])
+
+    @asynctest
+    async def test_host_key_revoked(self):
+        """Test server host keys handler showing a key revoked"""
+
+        await self._check_host_keys(['skey', 'skey_ecdsa'],
+                                    [['skey'], [], ['skey_ecdsa']],
+                                    [0, 0, 1, 1])
+
+    @asynctest
+    async def test_no_trusted_hosts(self):
+        """Test server host keys handler is disabled due to no trusted hosts"""
+
+        await self._check_host_keys(['skey'], None, None)
+
+    @asynctest
+    async def test_host_key_bad_signature(self):
+        """Test server host keys handler getting back a bad signature"""
+
+        with patch('asyncssh.connection.SSHServerConnection',
+                   _BadSignatureServerConnection):
+            await self._check_host_keys(['skey', 'skey_ecdsa'],
+                                        [['skey'], [], []],
+                                        [0, 0, 1, 0])
+
+    @asynctest
+    async def test_host_key_prove_failed(self):
+        """Test server host keys handler getting back a prove failure"""
+
+        with patch('asyncssh.connection.SSHServerConnection',
+                   _ProveFailedServerConnection):
+            await self._check_host_keys(['skey', 'skey_ecdsa'],
+                                        [['skey'], [], []],
+                                        [0, 0, 1, 0])
+
+
+class _TestConnectionListenSock(ServerTestCase):
+    """Unit test for specifying a listen socket"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server to connect to"""
+
+        sock = socket.socket()
+        sock.bind(('', 0))
+
+        return await cls.create_server(_TunnelServer, sock=sock)
+
+    @asynctest
+    async def test_connect(self):
+        """Test specifying explicit listen sock"""
+
+        with self.assertLogs(level='INFO'):
+            async with self.connect():
+                pass
+
 
 class _TestConnectionAsyncAcceptor(ServerTestCase):
     """Unit test for async acceptor"""
@@ -1527,7 +2003,29 @@ class _TestConnectionReverse(ServerTestCase):
             async with self.connect_reverse():
                 pass
 
-    @unittest.skipUnless(_nc_available, 'Netcat not available')
+    @asynctest
+    async def test_connect_reverse_sock(self):
+        """Test reverse connection using an already-connected socket"""
+
+        sock = socket.socket()
+        await self.loop.sock_connect(sock, (self._server_addr,
+                                            self._server_port))
+
+        async with self.connect_reverse(sock=sock):
+            pass
+
+    @asynctest
+    async def test_run_server(self):
+        """Test running an SSH server on an already-connected socket"""
+
+        sock = socket.socket()
+        await self.loop.sock_connect(sock, (self._server_addr,
+                                            self._server_port))
+
+        async with self.run_server(sock):
+            pass
+
+    @unittest.skipUnless(nc_available, 'Netcat not available')
     @asynctest
     async def test_connect_reverse_proxy(self):
         """Test reverse direction SSH connection with proxy command"""
@@ -1691,14 +2189,14 @@ class _TestServerX509Self(ServerTestCase):
 
     @asynctest
     async def test_connect_x509_untrusted_self(self):
-        """Test connecting with untrusted X.509 self-signed certficate"""
+        """Test connecting with untrusted X.509 self-signed certificate"""
 
         with self.assertRaises(asyncssh.HostKeyNotVerifiable):
             await self.connect(x509_trusted_certs='root_ca_cert.pem')
 
     @asynctest
     async def test_connect_x509_revoked_self(self):
-        """Test connecting with revoked X.509 self-signed certficate"""
+        """Test connecting with revoked X.509 self-signed certificate"""
 
         with self.assertRaises(asyncssh.HostKeyNotVerifiable):
             await self.connect(known_hosts=([], [], [], ['root_ca_cert.pem'],
@@ -1894,11 +2392,9 @@ class _TestServerWithoutCert(ServerTestCase):
 
             return _ValidateHostKeyClient(host_key='skey.pub')
 
-        algs = [asyncssh.read_public_key('skey.pub').get_algorithm()]
-
-        conn, _ = await self.create_connection(client_factory,
-                                               known_hosts=([], [], []),
-                                               server_host_key_algs=algs)
+        conn, _ = await self.create_connection(
+            client_factory, known_hosts=([], [], []),
+            server_host_key_algs=['rsa-sha2-256'])
 
         async with conn:
             pass
@@ -1979,6 +2475,13 @@ class _TestHostKeyAlias(ServerTestCase):
 
         with self.assertRaises(asyncssh.HostKeyNotVerifiable):
             await self.connect()
+
+    @asynctest
+    async def test_host_key_unknown(self):
+        """Test unknown host key alias"""
+
+        with self.assertRaises(asyncssh.HostKeyNotVerifiable):
+            await self.connect(host_key_alias='unknown')
 
     @asynctest
     async def test_host_key_match(self):
@@ -2182,9 +2685,129 @@ class _TestListenerContextManager(ServerTestCase):
         """Test using an SSH listener as a context manager"""
 
         async with self.listen() as server:
-            listen_port = server.sockets[0].getsockname()[1]
-
+            listen_port = server.get_port()
 
             async with asyncssh.connect('127.0.0.1', listen_port,
                                         known_hosts=(['skey.pub'], [], [])):
                 pass
+
+
+@patch_getaddrinfo
+class _TestCanonicalizeHost(ServerTestCase):
+    """Test hostname canonicalization"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server to connect to"""
+
+        return await cls.create_server(_TunnelServer)
+
+    @asynctest
+    async def test_canonicalize(self):
+        """Test hostname canonicalization"""
+
+        async with self.connect('testhost', known_hosts=None,
+                                canonicalize_hostname=True,
+                                canonical_domains=['test']) as conn:
+            self.assertEqual(conn.get_extra_info('host'), 'testhost.test')
+
+    @asynctest
+    async def test_canonicalize_max_dots(self):
+        """Test hostname canonicalization exceeding max_dots"""
+
+        async with self.connect('testhost.test', known_hosts=None,
+                                canonicalize_hostname=True,
+                                canonicalize_max_dots=0,
+                                canonical_domains=['test']) as conn:
+            self.assertEqual(conn.get_extra_info('host'), 'testhost.test')
+
+    @asynctest
+    async def test_canonicalize_ip_address(self):
+        """Test hostname canonicalization with IP address"""
+
+        async with self.connect('127.0.0.1', known_hosts=None,
+                                canonicalize_hostname=True,
+                                canonicalize_max_dots=3,
+                                canonical_domains=['test']) as conn:
+            self.assertEqual(conn.get_extra_info('host'), '127.0.0.1')
+
+    @asynctest
+    async def test_canonicalize_proxy(self):
+        """Test hostname canonicalization with proxy"""
+
+        with open('config', 'w') as f:
+            f.write('UserKnownHostsFile none\n')
+
+        async with self.connect('testhost', config='config',
+                                tunnel=f'localhost:{self._server_port}',
+                                canonicalize_hostname=True,
+                                canonical_domains=['test']) as conn:
+            self.assertEqual(conn.get_extra_info('host'), 'testhost.test')
+
+    @asynctest
+    async def test_canonicalize_always(self):
+        """Test hostname canonicalization for all connections"""
+
+        with open('config', 'w') as f:
+            f.write('UserKnownHostsFile none\n')
+
+        async with self.connect('testhost', config='config',
+                                tunnel=f'localhost:{self._server_port}',
+                                canonicalize_hostname='always',
+                                canonical_domains=['test']) as conn:
+            self.assertEqual(conn.get_extra_info('host'), 'testhost.test')
+
+    @asynctest
+    async def test_canonicalize_failure(self):
+        """Test hostname canonicalization failure"""
+
+        with self.assertRaises(socket.gaierror):
+            await self.connect('unknown', known_hosts=(['skey.pub'], [], []),
+                               canonicalize_hostname=True,
+                               canonical_domains=['test'])
+
+    @asynctest
+    async def test_canonicalize_failed_no_fallback(self):
+        """Test hostname canonicalization"""
+
+        with self.assertRaises(OSError):
+            await self.connect('unknown', known_hosts=(['skey.pub'], [], []),
+                               canonicalize_hostname=True,
+                               canonical_domains=['test'],
+                               canonicalize_fallback_local=False)
+
+    @asynctest
+    async def test_cname_returned(self):
+        """Test hostname canonicalization with cname returned"""
+
+        async with self.connect('testcname',
+                                known_hosts=(['skey.pub'], [], []),
+                                canonicalize_hostname=True,
+                                canonical_domains=['test'],
+                                canonicalize_permitted_cnames= \
+                                    [('*.test', '*.test')]) as conn:
+            self.assertEqual(conn.get_extra_info('host'), 'cname.test')
+
+    @asynctest
+    async def test_cname_not_returned(self):
+        """Test hostname canonicalization with cname not returned"""
+
+        async with self.connect('testcname',
+                                known_hosts=(['skey.pub'], [], []),
+                                canonicalize_hostname=True,
+                                canonical_domains=['test'],
+                                canonicalize_permitted_cnames= \
+                                    ['*.xxx:*.test']) as conn:
+            self.assertEqual(conn.get_extra_info('host'), 'testcname.test')
+
+    @asynctest
+    async def test_bad_cname_rules(self):
+        """Test hostname canonicalization with bad cname rules"""
+
+        with self.assertRaises(ValueError):
+            await self.connect('testcname',
+                               known_hosts=(['skey.pub'], [], []),
+                               canonicalize_hostname=True,
+                               canonical_domains=['test'],
+                               canonicalize_permitted_cnames= \
+                                   ['*.xxx:*.test:*.xxx'])

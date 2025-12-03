@@ -1,4 +1,4 @@
-# Copyright (c) 2018-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2018-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -64,7 +64,7 @@ class _KexRSA(Kex):
         self._k = 0
         self._encrypted_k = b''
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start RSA key exchange"""
 
         if self._conn.is_server():
@@ -142,7 +142,7 @@ class _KexRSA(Kex):
 
         self.send_packet(MSG_KEXRSA_DONE, String(sig))
 
-        self._conn.send_newkeys(self._k, h)
+        self._conn.send_newkeys(MPInt(self._k), h)
 
     def _process_done(self, _pkttype: int, _pktid: int,
                       packet: SSHPacket) -> None:
@@ -161,7 +161,7 @@ class _KexRSA(Kex):
         if not host_key.verify(h, sig):
             raise KeyExchangeFailed('Key exchange hash mismatch')
 
-        self._conn.send_newkeys(self._k, h)
+        self._conn.send_newkeys(MPInt(self._k), h)
 
     _packet_handlers = {
         MSG_KEXRSA_PUBKEY: _process_pubkey,

@@ -5,22 +5,24 @@ Maintainer: Debian Python Team <team+python@tracker.debian.org>
 Uploaders: Vincent Bernat <bernat@debian.org>
 Build-Depends:
  debhelper-compat (= 12),
+ dh-python,
  localehelper,
+ openssh-client,
+ openssl,
+ openssl-provider-legacy | openssl (<< 3.3.1-5~),
+ pybuild-plugin-pyproject,
  python3-all,
- python3-sphinx (>= 1.0.7+dfsg-1~),
- python3-setuptools,
- python3-cryptography,
  python3-bcrypt (>= 3.1.3) <!nocheck>,
+ python3-cryptography (>= 39.0),
  python3-fido2 <!nocheck>,
  python3-gssapi <!nocheck>,
  python3-libnacl <!nocheck>,
  python3-openssl <!nocheck>,
+ python3-pkcs11 <!nocheck>,
+ python3-pytest <!nocheck>,
+ python3-setuptools,
+ python3-sphinx (>= 1.0.7+dfsg-1~),
  python3-typing-extensions <!nocheck>,
-# not packaged
-# python3-pkcs11 <!nocheck>,
- openssl,
- openssh-client,
- dh-python
 Standards-Version: 4.5.1
 Homepage: https://github.com/ronf/asyncssh
 Vcs-Browser: https://salsa.debian.org/python-team/packages/python-asyncssh

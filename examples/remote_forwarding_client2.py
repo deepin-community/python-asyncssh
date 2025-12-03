@@ -1,6 +1,6 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3.7
 #
-# Copyright (c) 2013-2021 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -24,7 +24,7 @@ import asyncio, asyncssh, sys
 from functools import partial
 from typing import Awaitable
 
-def connection_requested(conn: asyncssh.SSHServerConnection, orig_host: str,
+def connection_requested(conn: asyncssh.SSHClientConnection, orig_host: str,
                          orig_port: int) -> Awaitable[asyncssh.SSHForwarder]:
     if orig_host in ('127.0.0.1', '::1'):
         return conn.forward_connection('localhost', 80)
@@ -40,6 +40,6 @@ async def run_client() -> None:
         await listener.wait_closed()
 
 try:
-    asyncio.get_event_loop().run_until_complete(run_client())
+    asyncio.run(run_client())
 except (OSError, asyncssh.Error) as exc:
     sys.exit('SSH connection failed: ' + str(exc))

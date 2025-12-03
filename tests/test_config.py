@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2020-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -71,7 +71,7 @@ class _TestConfig(TempDirTestCase):
 
         for value, result in (('yes', True), ('true', True),
                               ('no', False), ('false', False)):
-            config = self._parse_config('Compression %s' % value)
+            config = self._parse_config(f'Compression {value}')
             self.assertEqual(config.get('Compression'), result)
 
         config = self._parse_config('Compression yes\nCompression no')
@@ -101,12 +101,25 @@ class _TestConfig(TempDirTestCase):
         for family, result in (('any', socket.AF_UNSPEC),
                                ('inet', socket.AF_INET),
                                ('inet6', socket.AF_INET6)):
-            config = self._parse_config('AddressFamily %s' % family)
+            config = self._parse_config(f'AddressFamily {family}')
             self.assertEqual(config.get('AddressFamily'), result)
 
         config = self._parse_config('AddressFamily inet\n'
                                     'AddressFamily inet6')
         self.assertEqual(config.get('AddressFamily'), socket.AF_INET)
+
+    def test_set_canonicaize_host(self):
+        """Test canonicalize host config option"""
+
+        for value, result in (('yes', True), ('true', True),
+                              ('no', False), ('false', False),
+                              ('always', 'always')):
+            config = self._parse_config(f'CanonicalizeHostname {value}')
+            self.assertEqual(config.get('CanonicalizeHostname'), result)
+
+        config = self._parse_config('CanonicalizeHostname yes\n'
+                                    'CanonicalizeHostname no')
+        self.assertEqual(config.get('CanonicalizeHostname'), True)
 
     def test_set_rekey_limit(self):
         """Test rekey limit config option"""
@@ -117,7 +130,7 @@ class _TestConfig(TempDirTestCase):
                               ('default', ((), ())),
                               ('default 2', ((), '2')),
                               ('default none', ((), None))):
-            config = self._parse_config('RekeyLimit %s' % value)
+            config = self._parse_config(f'RekeyLimit {value}')
             self.assertEqual(config.get('RekeyLimit'), result)
 
         config = self._parse_config('RekeyLimit 1 2\nRekeyLimit 3 4')
@@ -143,8 +156,8 @@ class _TestConfig(TempDirTestCase):
         with open('.ssh/include', 'w') as f:
             f.write('Port 2222')
 
-        for path in ('include', Path('.ssh/include').absolute().as_posix()):
-            config = self._parse_config('Include %s' % path)
+        for path in ('include', Path('.ssh/include').resolve().as_posix()):
+            config = self._parse_config(f'Include {path}')
             self.assertEqual(config.get('Port'), 2222)
 
     def test_missing_include(self):
@@ -182,6 +195,24 @@ class _TestConfig(TempDirTestCase):
         config = self._parse_config('Match user xxx\nMatch all\nPort 2222')
         self.assertEqual(config.get('Port'), 2222)
 
+    def test_match_negated(self):
+        """Test a match block which never matches due to negation"""
+
+        config = self._parse_config('Match !all user xxx\nPort 2222')
+        self.assertEqual(config.get('Port'), None)
+
+    def test_match_canonical(self):
+        """Test a match block which matches when the host is canonicalized"""
+
+        config = self._parse_config('Match canonical\nPort 2222')
+        self.assertEqual(config.get('Port'), None)
+
+    def test_match_final(self):
+        """Test a match block which matches on the final parsing pass"""
+
+        config = self._parse_config('Match final\nPort 2222')
+        self.assertEqual(config.get('Port'), None)
+
     def test_match_exec(self):
         """Test a match block which runs a subprocess"""
 
@@ -214,7 +245,7 @@ class _TestConfig(TempDirTestCase):
         """Test config option with equals instead of space"""
 
         for delimiter in ('=', ' =', '= ', ' = '):
-            config = self._parse_config('Compression%syes' % delimiter)
+            config = self._parse_config(f'Compression{delimiter}yes')
             self.assertEqual(config.get('Compression'), True)
 
     def test_unknown(self):
@@ -231,6 +262,8 @@ class _TestConfig(TempDirTestCase):
                 ('Unbalanced quotes', 'BindAddress "foo'),
                 ('Extra data at end', 'BindAddress foo bar'),
                 ('Invalid address family', 'AddressFamily xxx'),
+                ('Invalid canonicalization option',
+                 'CanonicalizeHostname xxx'),
                 ('Invalid boolean', 'Compression xxx'),
                 ('Invalid integer', 'Port xxx'),
                 ('Invalid match condition', 'Match xxx')):
@@ -243,13 +276,14 @@ class _TestClientConfig(_TestConfig):
     """Unit tests for client config objects"""
 
     def _load_config(self, config, last_config=None, reload=False,
-                     local_user='user', user=(), host='host', port=()):
+                     canonical=False, final=False, local_user='user',
+                     user=(), host='host', port=()):
         """Load a client configuration"""
 
         # pylint: disable=arguments-differ
 
-        return SSHClientConfig.load(last_config, config, reload,
-                                    local_user, user, host, port)
+        return SSHClientConfig.load(last_config, config, reload, canonical,
+                                    final, local_user, user, host, port)
 
     def test_set_string_none(self):
         """Test string config option"""
@@ -279,11 +313,21 @@ class _TestClientConfig(_TestConfig):
                                     'UserKnownHostsFile file2')
         self.assertEqual(config.get('UserKnownHostsFile'), ['file1'])
 
+        config = self._parse_config('UserKnownHostsFile none\n'
+                                    'UserKnownHostsFile file2')
+        self.assertEqual(config.get('UserKnownHostsFile'), [])
+
     def test_append_string_list(self):
         """Test appending multiple string config options to a list"""
 
-        config = self._parse_config('SendEnv foo\nSendEnv  bar baz')
+        config = self._parse_config('SendEnv foo\nSendEnv bar baz')
         self.assertEqual(config.get('SendEnv'), ['foo', 'bar', 'baz'])
+
+    def test_set_environment(self):
+        """Test setting environment with equals-separated key/value pairs"""
+
+        config = self._parse_config('SetEnv A=1 B= C=D=2\nSetEnv E=3')
+        self.assertEqual(config.get('SetEnv'), ['A=1', 'B=', 'C=D=2'])
 
     def test_set_remote_command(self):
         """Test setting a remote command"""
@@ -291,13 +335,25 @@ class _TestClientConfig(_TestConfig):
         config = self._parse_config('    RemoteCommand     foo  bar  baz')
         self.assertEqual(config.get('RemoteCommand'), 'foo  bar  baz')
 
+    def test_set_forward_agent(self):
+        """Test agent forwarding path config option"""
+
+        for value, result in (('yes', True), ('true', True),
+                              ('no', False), ('false', False),
+                              ('agent', 'agent'), ('%d/agent', './agent')):
+            config = self._parse_config(f'ForwardAgent {value}')
+            self.assertEqual(config.get('ForwardAgent'), result)
+
+        config = self._parse_config('ForwardAgent yes\nForwardAgent no')
+        self.assertEqual(config.get('ForwardAgent'), True)
+
     def test_set_request_tty(self):
         """Test pseudo-terminal request config option"""
 
         for value, result in (('yes', True), ('true', True),
                               ('no', False), ('false', False),
                               ('force', 'force'), ('auto', 'auto')):
-            config = self._parse_config('RequestTTY %s' % value)
+            config = self._parse_config(f'RequestTTY {value}')
             self.assertEqual(config.get('RequestTTY'), result)
 
         config = self._parse_config('RequestTTY yes\nRequestTTY no')
@@ -343,6 +399,17 @@ class _TestClientConfig(_TestConfig):
 
         self.assertEqual(config.get('User'), 'newuser')
         self.assertEqual(config.get('BindAddress'), 'addr')
+        self.assertEqual(config.get('Port'), 2222)
+
+    def test_tag(self):
+        """Test setting and matching a tag"""
+
+        config = self._parse_config('Tag tag2\n'
+                                    'Match tagged tag1\n'
+                                    '  Port 1111\n'
+                                    'Match tagged tag*\n'
+                                    '  Port 2222')
+
         self.assertEqual(config.get('Port'), 2222)
 
     def test_port_already_set(self):
@@ -417,8 +484,14 @@ class _TestClientConfig(_TestConfig):
 
             return path
 
+        def mock_pathlib_expanduser(self):
+            """Expand user even with os.path.expanduser mocked out"""
+
+            return Path(os.environ['HOME'], *self.parts[1:])
+
         with self.assertRaises(asyncssh.ConfigParseError):
-            with patch('os.path.expanduser', mock_expanduser):
+            with patch('os.path.expanduser', mock_expanduser), \
+                    patch('pathlib.Path.expanduser', mock_pathlib_expanduser):
                 self._parse_config('RemoteCommand %d')
 
     def test_uid_percent_expansion_unavailable(self):
@@ -429,7 +502,7 @@ class _TestClientConfig(_TestConfig):
         def mock_hasattr(obj, attr):
             if obj == os and attr == 'getuid':
                 return False
-            else:
+            else: # pragma: no cover
                 return orig_hasattr(obj, attr)
 
         with self.assertRaises(asyncssh.ConfigParseError):
@@ -441,24 +514,39 @@ class _TestClientConfig(_TestConfig):
 
         for desc, config_data in (
                 ('Bad token in hostname', 'Hostname %p'),
-                ('Invalid token', 'IdentityFile %x'),
-                ('Percent at end', 'IdentityFile %')):
+                ('Invalid token', 'IdentityFile %x')):
             with self.subTest(desc):
                 with self.assertRaises(asyncssh.ConfigParseError):
                     self._parse_config(config_data)
+
+    def test_env_expansion(self):
+        """Test environment variable expansion"""
+
+        config = self._parse_config('RemoteCommand ${HOME}/.ssh')
+
+        self.assertEqual(config.get('RemoteCommand'), './.ssh')
+
+    def test_invalid_env_expansion(self):
+        """Test invalid environment variable expansion"""
+
+        with self.assertRaises(asyncssh.ConfigParseError):
+            self._parse_config('RemoteCommand ${XXX}')
+
 
 class _TestServerConfig(_TestConfig):
     """Unit tests for server config objects"""
 
     def _load_config(self, config, last_config=None, reload=False,
+                     canonical=False, final=False,
                      local_addr='127.0.0.1', local_port=22,
                      user='user', host=None, addr='127.0.0.1'):
         """Load a server configuration"""
 
         # pylint: disable=arguments-differ
 
-        return SSHServerConfig.load(last_config, config, reload,
-                                    local_addr, local_port, user, host, addr)
+        return SSHServerConfig.load(last_config, config, reload, canonical,
+                                    final, local_addr, local_port, user,
+                                    host, addr)
 
     def test_match_local_address(self):
         """Test matching on local address"""

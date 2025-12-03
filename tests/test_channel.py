@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2016-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -23,6 +23,7 @@
 import asyncio
 import os
 import tempfile
+import unittest
 from signal import SIGINT
 
 from unittest.mock import patch
@@ -40,6 +41,8 @@ from asyncssh.constants import MSG_CHANNEL_SUCCESS
 from asyncssh.packet import Byte, String, UInt32
 from asyncssh.public_key import CERT_TYPE_USER
 from asyncssh.stream import SSHTCPStreamSession, SSHUNIXStreamSession
+from asyncssh.stream import SSHTunTapStreamSession
+from asyncssh.tuntap import SSH_TUN_MODE_POINTTOPOINT, SSH_TUN_MODE_ETHERNET
 
 from .server import Server, ServerTestCase
 from .util import asynctest, echo, make_certificate
@@ -53,9 +56,7 @@ class _ClientChannel(asyncssh.SSHClientChannel):
     def _send_request(self, request, *args, want_reply=False):
         """Send a channel request"""
 
-        if request == b'env' and args[1] == String('invalid'):
-            args = args[:1] + (String(b'\xff'),)
-        elif request == b'pty-req':
+        if request == b'pty-req':
             if args[5][-6:-5] == Byte(PTY_OP_PARTIAL):
                 args = args[:5] + (String(args[5][4:-5]),)
             elif args[5][-6:-5] == Byte(PTY_OP_NO_END):
@@ -246,6 +247,15 @@ class _PTYServerSession(asyncssh.SSHServerSession):
         chan.close()
 
 
+class _ClientSessionCleanupError(asyncssh.SSHClientSession):
+    """Test of exception during client session cleanup"""
+
+    def connection_lost(self, exc):
+        """Raise an error when a client session is cleaned up"""
+
+        raise RuntimeError('Exception in session cleanup test')
+
+
 class _ChannelServer(Server):
     """Server for testing the AsyncSSH channel API"""
 
@@ -270,7 +280,7 @@ class _ChannelServer(Server):
         elif action == 'agent':
             try:
                 async with asyncssh.connect_agent(self._conn) as agent:
-                    stdout.write(str(len((await agent.get_keys()))) + '\n')
+                    stdout.write(str(len(await agent.get_keys())) + '\n')
             except (OSError, asyncssh.ChannelOpenError):
                 stdout.channel.exit(1)
         elif action == 'agent_sock':
@@ -279,7 +289,7 @@ class _ChannelServer(Server):
             if agent_path:
                 async with asyncssh.connect_agent(agent_path) as agent:
                     await asyncio.sleep(0.1)
-                    stdout.write(str(len((await agent.get_keys()))) + '\n')
+                    stdout.write(str(len(await agent.get_keys())) + '\n')
             else:
                 stdout.channel.exit(1)
         elif action == 'rejected_agent':
@@ -343,6 +353,22 @@ class _ChannelServer(Server):
                 await chan.accept(SSHUNIXStreamSession, b'\xff')
             except asyncssh.ChannelOpenError:
                 stdout.channel.exit(1)
+        elif action == 'rejected_tun_request':
+            chan = self._conn.create_tuntap_channel()
+
+            try:
+                await chan.open(SSHTunTapStreamSession,
+                                SSH_TUN_MODE_POINTTOPOINT, 0)
+            except asyncssh.ChannelOpenError:
+                stdout.channel.exit(1)
+        elif action == 'rejected_tap_request':
+            chan = self._conn.create_tuntap_channel()
+
+            try:
+                await chan.open(SSHTunTapStreamSession,
+                                SSH_TUN_MODE_ETHERNET, 0)
+            except asyncssh.ChannelOpenError:
+                stdout.channel.exit(1)
         elif action == 'late_auth_banner':
             try:
                 self._conn.send_auth_banner('auth banner')
@@ -355,7 +381,20 @@ class _ChannelServer(Server):
             stdin.channel.send_packet(MSG_CHANNEL_OPEN_FAILURE,
                                       UInt32(0), String(''), String(''))
         elif action == 'env':
+            value = stdin.channel.get_environment_bytes().get(b'TEST', b'')
+            stdout.write(value.decode('utf-8', 'backslashreplace') + '\n')
+        elif action == 'env_binary_key':
+            value = stdin.channel.get_environment_bytes().get(b'TEST\xff', b'')
+            stdout.write(value.decode('utf-8', 'backslashreplace') + '\n')
+        elif action == 'env_str':
             value = stdin.channel.get_environment().get('TEST', '')
+            stdout.write(value + '\n')
+        elif action == 'env_str_cached':
+            value1 = stdin.channel.get_environment().get('TEST', '')
+            value2 = stdin.channel.get_environment().get('TEST', '')
+            stdout.write(value1 + value2 + '\n')
+        elif action == 'env_non_string_key':
+            value = stdin.channel.get_environment().get('1', '')
             stdout.write(value + '\n')
         elif action == 'term':
             chan = stdin.channel
@@ -398,16 +437,20 @@ class _ChannelServer(Server):
         elif action == 'empty_data':
             stdin.channel.send_packet(MSG_CHANNEL_DATA, String(''))
         elif action == 'partial_unicode':
-            data = '\xff\xff'.encode('utf-8')
+            data = '\xff\xff'.encode()
             stdin.channel.send_packet(MSG_CHANNEL_DATA, String(data[:3]))
             stdin.channel.send_packet(MSG_CHANNEL_DATA, String(data[3:]))
         elif action == 'partial_unicode_at_eof':
-            data = '\xff\xff'.encode('utf-8')
+            data = '\xff\xff'.encode()
             stdin.channel.send_packet(MSG_CHANNEL_DATA, String(data[:3]))
         elif action == 'unicode_error':
             stdin.channel.send_packet(MSG_CHANNEL_DATA, String(b'\xff'))
         elif action == 'data_past_window':
             stdin.channel.send_packet(MSG_CHANNEL_DATA,
+                                      String(2*1025*1024*'\0'))
+        elif action == 'ext_data_past_window':
+            stdin.channel.send_packet(MSG_CHANNEL_EXTENDED_DATA,
+                                      UInt32(asyncssh.EXTENDED_DATA_STDERR),
                                       String(2*1025*1024*'\0'))
         elif action == 'data_after_eof':
             stdin.channel.send_packet(MSG_CHANNEL_EOF)
@@ -733,7 +776,7 @@ class _TestChannel(ServerTestCase):
             async with self.connect() as conn:
                 chan, _ = await _create_session(conn)
 
-                self.assertFalse((await chan.make_request('unknown')))
+                self.assertFalse(await chan.make_request('unknown'))
 
     @asynctest
     async def test_invalid_channel_request(self):
@@ -828,14 +871,14 @@ class _TestChannel(ServerTestCase):
             chan.close()
 
     @asynctest
-    async def test_agent_forwarding(self):
-        """Test SSH agent forwarding"""
+    async def test_agent_forwarding_explicit(self):
+        """Test SSH agent forwarding with explicit path"""
 
         if not self.agent_available(): # pragma: no cover
             self.skipTest('ssh-agent not available')
 
         async with self.connect(username='ckey',
-                                agent_forwarding=True) as conn:
+                                agent_forwarding='agent') as conn:
             chan, session = await _create_session(conn, 'agent')
 
             await chan.wait_closed()
@@ -907,6 +950,18 @@ class _TestChannel(ServerTestCase):
         """Test receiving connection on invalid UNIX listener path"""
 
         await self._check_action('invalid_unix_listener', None)
+
+    @asynctest
+    async def test_rejected_tun_request(self):
+        """Test receiving inbound TUN request"""
+
+        await self._check_action('rejected_tun_request', 1)
+
+    @asynctest
+    async def test_rejected_tap_request(self):
+        """Test receiving inbound TAP request"""
+
+        await self._check_action('rejected_tap_request', 1)
 
     @asynctest
     async def test_agent_forwarding_failure(self):
@@ -1097,16 +1152,115 @@ class _TestChannel(ServerTestCase):
 
     @asynctest
     async def test_env(self):
-        """Test setting environment"""
+        """Test setting environment with byte strings"""
 
         async with self.connect() as conn:
             chan, session = await _create_session(conn, 'env',
+                                                  env={b'TEST': b'test'})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\n')
+
+    @asynctest
+    async def test_env_str(self):
+        """Test setting environment using Unicode strings"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env_str',
                                                   env={'TEST': 'test'})
 
             await chan.wait_closed()
 
             result = ''.join(session.recv_buf[None])
             self.assertEqual(result, 'test\n')
+
+    @asynctest
+    async def test_env_str_cached(self):
+        """Test caching of Unicode string environment dict on server"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env_str_cached',
+                                                  env={'TEST': 'test'})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'testtest\n')
+
+    @asynctest
+    async def test_env_invalid_str(self):
+        """Test trying to access binary envionment value as a Unicode string"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env_str',
+                                                  env={'TEST': b'test\xff'})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, '\n')
+
+    @asynctest
+    async def test_env_binary_key(self):
+        """Test setting environment with binary data in key"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env_binary_key',
+                                                  env={b'TEST\xff': 'test'})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\n')
+
+    @asynctest
+    async def test_env_binary_value(self):
+        """Test setting environment with binary data in value"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env',
+                                                  env={'TEST': b'test\xff'})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\\xff\n')
+
+    @asynctest
+    async def test_env_non_string_key(self):
+        """Test setting environment with non-string as a key"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env_non_string_key',
+                                                  env={1: 'test'})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\n')
+
+    @asynctest
+    async def test_env_non_string_value(self):
+        """Test setting environment with non-string as a value"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env',
+                                                  env={'TEST': 1})
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, '1\n')
+
+    @asynctest
+    async def test_invalid_env(self):
+        """Test sending invalid environment"""
+
+        async with self.connect() as conn:
+            with self.assertRaises(ValueError):
+                await _create_session(conn, 'env', env=1)
 
     @asynctest
     async def test_env_from_connect(self):
@@ -1127,6 +1281,32 @@ class _TestChannel(ServerTestCase):
         async with self.connect() as conn:
             chan, session = await _create_session(conn, 'env',
                                                   env=['TEST=test'])
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\n')
+
+    @asynctest
+    async def test_env_list_binary(self):
+        """Test setting environment using a list of name=value byte strings"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env',
+                                                  env=[b'TEST=test\xff'])
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\\xff\n')
+
+    @asynctest
+    async def test_env_tuple(self):
+        """Test setting environment using a tuple of name=value strings"""
+
+        async with self.connect() as conn:
+            chan, session = await _create_session(conn, 'env',
+                                                  env=('TEST=test',))
 
             await chan.wait_closed()
 
@@ -1157,6 +1337,25 @@ class _TestChannel(ServerTestCase):
 
             result = ''.join(session.recv_buf[None])
             self.assertEqual(result, 'test\n')
+
+    @unittest.skipUnless(os.supports_bytes_environ,
+                         'skip binary send env if not supported by OS')
+    @asynctest
+    async def test_send_env_binary(self):
+        """Test sending local environment using a byte string"""
+
+        async with self.connect() as conn:
+            try:
+                os.environb[b'TEST'] = b'test\xff'
+                chan, session = await _create_session(conn, 'env',
+                                                      send_env=[b'TEST'])
+            finally:
+                del os.environb[b'TEST']
+
+            await chan.wait_closed()
+
+            result = ''.join(session.recv_buf[None])
+            self.assertEqual(result, 'test\\xff\n')
 
     @asynctest
     async def test_send_env_from_connect(self):
@@ -1192,20 +1391,6 @@ class _TestChannel(ServerTestCase):
 
             result = ''.join(session.recv_buf[None])
             self.assertEqual(result, '2\n')
-
-    @asynctest
-    async def test_invalid_env(self):
-        """Test sending invalid environment"""
-
-        with patch('asyncssh.connection.SSHClientChannel', _ClientChannel):
-            async with self.connect() as conn:
-                chan, session = await _create_session(
-                    conn, 'env', env={'TEST': 'invalid'})
-
-                await chan.wait_closed()
-
-                result = ''.join(session.recv_buf[None])
-                self.assertEqual(result, '\n')
 
     @asynctest
     async def test_xon_xoff_enable(self):
@@ -1479,6 +1664,15 @@ class _TestChannel(ServerTestCase):
             await chan.wait_closed()
 
     @asynctest
+    async def test_ext_data_past_window(self):
+        """Test receiving an extended data packet past the advertised window"""
+
+        async with self.connect() as conn:
+            chan, _ = await _create_session(conn, 'ext_data_past_window')
+
+            await chan.wait_closed()
+
+    @asynctest
     async def test_data_after_eof(self):
         """Test receiving data after EOF"""
 
@@ -1576,6 +1770,13 @@ class _TestChannel(ServerTestCase):
             await chan.wait_closed()
             self.assertEqual(session.exit_status, 255)
 
+    @asynctest
+    async def test_client_session_cleanup_error(self):
+        """Test error in client session cleanup"""
+
+        async with self.connect() as conn:
+            await conn.create_session(_ClientSessionCleanupError)
+
 
 class _TestChannelNoPTY(ServerTestCase):
     """Unit tests for AsyncSSH channel module with PTYs disallowed"""
@@ -1663,8 +1864,9 @@ class _TestConnectionDropbearClient(ServerTestCase):
         """Test reduced dropbear send packet size"""
 
         with patch('asyncssh.connection.SSHServerChannel', _ServerChannel):
-            async with self.connect(client_version='dropbear',
-                                    max_pktsize=32759) as conn:
+            async with self.connect(
+                    client_version='dropbear', max_pktsize=32759,
+                    compression_algs=['zlib@openssh.com']) as conn:
                 _, stdout, _ = await conn.open_session('send_pktsize')
                 self.assertEqual((await stdout.read()), '32758')
 
@@ -1690,7 +1892,8 @@ class _TestConnectionDropbearServer(ServerTestCase):
         """Test reduced dropbear send packet size"""
 
         with patch('asyncssh.connection.SSHClientChannel', _ClientChannel):
-            async with self.connect() as conn:
+            async with self.connect(
+                    compression_algs='zlib@openssh.com') as conn:
                 stdin, _, _ = await conn.open_session()
                 self.assertEqual(stdin.channel.get_send_pktsize(), 32758)
 

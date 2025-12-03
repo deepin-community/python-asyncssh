@@ -21,6 +21,7 @@
 """Unit tests for AsyncSSH stream API"""
 
 import asyncio
+import re
 
 import asyncssh
 
@@ -48,11 +49,23 @@ class _StreamServer(Server):
             await stdin.read(1)
             stdout.write('\n')
         elif action == 'disconnect':
-            stdout.write((await stdin.read(1)))
+            stdout.write(await stdin.read(1))
             raise asyncssh.ConnectionLost('Connection lost')
         elif action == 'custom_disconnect':
             await stdin.read(1)
             raise asyncssh.DisconnectError(99, 'Disconnect')
+        elif action == 'partial':
+            try:
+                await stdin.readexactly(10)
+            except asyncio.IncompleteReadError as exc:
+                stdout.write(exc.partial)
+
+            try:
+                await stdin.read()
+            except asyncssh.TerminalSizeChanged:
+                pass
+
+            stdout.write(await stdin.readexactly(5))
         else:
             stdin.channel.exit(255)
 
@@ -80,6 +93,20 @@ class _StreamServer(Server):
             return self._begin_session
         else:
             return False
+
+
+class _UpstreamForwardingServer(Server):
+    """Server for testing forwarding between SSH connections"""
+
+    def __init__(self, upstream_conn):
+        super().__init__()
+
+        self._upstream_conn = upstream_conn
+
+    def session_requested(self):
+        """Handle a request to create a new session"""
+
+        return self._upstream_conn
 
 
 class _TestStream(ServerTestCase):
@@ -116,9 +143,9 @@ class _TestStream(ServerTestCase):
         self.assertEqual(data, stdout_data)
         self.assertEqual(data, stderr_data)
 
-        await stdin.channel.wait_closed()
         await stdin.drain()
         stdin.close()
+        await stdin.channel.wait_closed()
 
 
     @asynctest
@@ -127,6 +154,24 @@ class _TestStream(ServerTestCase):
 
         async with self.connect() as conn:
             await self._check_session(conn)
+
+    @asynctest
+    async def test_upstream_shell(self):
+        """Test upstream forwarding of a shell request"""
+
+        def upstream_server():
+            """Return a server capable of forwarding between SSH connections"""
+
+            return _UpstreamForwardingServer(upstream_conn)
+
+        async with self.connect() as upstream_conn:
+            upstream_listener = await self.create_server(upstream_server)
+            upstream_port = upstream_listener.get_port()
+
+            async with self.connect('127.0.0.1', upstream_port) as conn:
+                await self._check_session(conn)
+
+            upstream_listener.close()
 
     @asynctest
     async def test_shell_failure(self):
@@ -232,6 +277,19 @@ class _TestStream(ServerTestCase):
 
             with self.assertRaises(asyncssh.ConnectionLost):
                 await stdout.readline()
+
+    @asynctest
+    async def test_readexactly_partial_exception(self):
+        """Test readexactly returning partial data before an exception"""
+
+        async with self.connect() as conn:
+            stdin, stdout, _ = await conn.open_session('partial')
+
+            stdin.write('abcde')
+            stdout.channel.change_terminal_size(80, 24)
+            stdin.write('fghij')
+
+            self.assertEqual((await stdout.read()), 'abcdefghij')
 
     @asynctest
     async def test_custom_disconnect(self):
@@ -365,6 +423,27 @@ class _TestStream(ServerTestCase):
                 await stdout.readuntil('')
 
             stdin.close()
+
+    @asynctest
+    async def test_readuntil_regex(self):
+        """Test readuntil with a regex pattern"""
+
+        async with self.connect() as conn:
+            stdin, stdout, _ = await conn.open_session()
+            stdin.write("hello world\nhello world")
+            output = await stdout.readuntil(
+                re.compile('hello world'), len('hello world')
+            )
+            self.assertEqual(output, "hello world")
+
+            output = await stdout.readuntil(
+                re.compile('hello world'), len('hello world')
+            )
+            self.assertEqual(output, "\nhello world")
+
+            stdin.close()
+
+        await conn.wait_closed()
 
     @asynctest
     async def test_abort(self):

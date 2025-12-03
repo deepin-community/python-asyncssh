@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2023 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -43,7 +43,47 @@ _hash_algs = {b'ssh-rsa':                'sha1',
 
 
 _PrivateKeyArgs = Tuple[int, int, int, int, int, int, int, int]
+_PrivateKeyConstructArgs = Tuple[int, int, int, int, int, int, int, int, bool]
 _PublicKeyArgs = Tuple[int, int]
+
+
+_default_skip_rsa_key_validation = False
+
+
+def set_default_skip_rsa_key_validation(skip_validation: bool) -> None:
+    """Set whether to disable RSA key validation in OpenSSL
+
+       OpenSSL 3.x does additional validation when loading RSA keys
+       as an added security measure. However, the result is that
+       loading a key can take significantly longer than it did before.
+
+       If all your RSA keys are coming from a trusted source, you can
+       call this function with a value of `True` to default to skipping
+       these checks on RSA keys, reducing the cost back down to what it
+       was in earlier releases.
+
+       This can also be set on a case by case basis by using the new
+       `unsafe_skip_rsa_key_validation` argument on the functions used
+       to load keys. This will only affect loading keys of type RSA.
+
+       .. note:: The extra cost only applies to loading existing keys, and
+                 not to generating new keys. Also, in cases where a key is
+                 used repeatedly, it can be loaded once into an `SSHKey`
+                 object and reused without having to pay the cost each time.
+                 So, this call should not be needed in most applications.
+
+                 If an application does need this, it is strongly
+                 recommended that the `unsafe_skip_rsa_key_validation`
+                 argument be used rather than using this function to
+                 change the default behavior for all load operations.
+
+    """
+
+    # pylint: disable=global-statement
+
+    global _default_skip_rsa_key_validation
+
+    _default_skip_rsa_key_validation = skip_validation
 
 
 class RSAKey(SSHKey):
@@ -52,13 +92,16 @@ class RSAKey(SSHKey):
     _key: Union[RSAPrivateKey, RSAPublicKey]
 
     algorithm = b'ssh-rsa'
-    default_hash_name = 'sha256'
+    default_x509_hash = 'sha256'
     pem_name = b'RSA'
     pkcs8_oid = ObjectIdentifier('1.2.840.113549.1.1.1')
     sig_algorithms = (b'rsa-sha2-256', b'rsa-sha2-512',
                       b'ssh-rsa-sha224@ssh.com', b'ssh-rsa-sha256@ssh.com',
                       b'ssh-rsa-sha384@ssh.com', b'ssh-rsa-sha512@ssh.com',
                       b'ssh-rsa')
+    cert_sig_algorithms = (b'rsa-sha2-256', b'rsa-sha2-512', b'ssh-rsa')
+    cert_algorithms = tuple(alg + b'-cert-v01@openssh.com'
+                            for alg in cert_sig_algorithms)
     x509_sig_algorithms = (b'rsa2048-sha256', b'ssh-rsa')
     x509_algorithms = tuple(b'x509v3-' + alg for alg in x509_sig_algorithms)
     all_sig_algorithms = set(x509_sig_algorithms + sig_algorithms)
@@ -91,9 +134,14 @@ class RSAKey(SSHKey):
     def make_private(cls, key_params: object) -> SSHKey:
         """Construct an RSA private key"""
 
-        n, e, d, p, q, dmp1, dmq1, iqmp = cast(_PrivateKeyArgs, key_params)
+        n, e, d, p, q, dmp1, dmq1, iqmp, unsafe_skip_rsa_key_validation = \
+            cast(_PrivateKeyConstructArgs, key_params)
 
-        return cls(RSAPrivateKey.construct(n, e, d, p, q, dmp1, dmq1, iqmp))
+        if unsafe_skip_rsa_key_validation is None:
+            unsafe_skip_rsa_key_validation = _default_skip_rsa_key_validation
+
+        return cls(RSAPrivateKey.construct(n, e, d, p, q, dmp1, dmq1, iqmp,
+                                           unsafe_skip_rsa_key_validation))
 
     @classmethod
     def make_public(cls, key_params: object) -> SSHKey:
@@ -265,7 +313,7 @@ class RSAKey(SSHKey):
 
 register_public_key_alg(b'ssh-rsa', RSAKey, True)
 
-for _alg  in (b'rsa-sha2-256', b'rsa-sha2-512', b'ssh-rsa'):
+for _alg in RSAKey.cert_sig_algorithms:
     register_certificate_alg(1, _alg, _alg + b'-cert-v01@openssh.com',
                              RSAKey, SSHOpenSSHCertificateV01, True)
 

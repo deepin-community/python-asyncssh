@@ -1,4 +1,4 @@
-# Copyright (c) 2013-2022 by Ron Frederick <ronf@timeheart.net> and others.
+# Copyright (c) 2013-2024 by Ron Frederick <ronf@timeheart.net> and others.
 #
 # This program and the accompanying materials are made available under
 # the terms of the Eclipse Public License v2.0 which accompanies this
@@ -26,6 +26,7 @@ import codecs
 import inspect
 import re
 import signal as _signal
+import sys
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable
 from typing import Dict, Generic, Iterable, List, Mapping, Optional
@@ -45,18 +46,22 @@ from .editor import SSHLineEditorChannel, SSHLineEditorSession
 
 from .logging import SSHLogger
 
-from .misc import ChannelOpenError, MaybeAwait, ProtocolError
-from .misc import get_symbol_names, map_handler_name
+from .misc import ChannelOpenError, EnvMap, MaybeAwait, ProtocolError
+from .misc import TermModes, TermSize, TermSizeArg
+from .misc import decode_env, encode_env, get_symbol_names, map_handler_name
 
 from .packet import Boolean, Byte, String, UInt32, SSHPacket, SSHPacketHandler
 
-from .session import TermModes, TermSize, TermSizeArg
 from .session import SSHSession, SSHClientSession, SSHServerSession
-from .session import SSHTCPSession, SSHUNIXSession
+from .session import SSHTCPSession, SSHUNIXSession, SSHTunTapSession
 from .session import SSHSessionFactory, SSHClientSessionFactory
 from .session import SSHTCPSessionFactory, SSHUNIXSessionFactory
+from .session import SSHTunTapSessionFactory
 
 from .stream import DataType
+
+from .tuntap import SSH_TUN_MODE_POINTTOPOINT, SSH_TUN_UNIT_ANY
+from .tuntap import SSH_TUN_AF_INET, SSH_TUN_AF_INET6
 
 
 if TYPE_CHECKING:
@@ -75,7 +80,7 @@ _signal_numbers = {k[3:]: int(v) for (k, v) in vars(_signal).items()
 _signal_names = {v: k for (k, v) in _signal_numbers.items()}
 
 _ExitSignal = Tuple[str, bool, str, str]
-_RequestHandler = Callable[[SSHPacket], Optional[bool]]
+_RequestHandler = Optional[Callable[[SSHPacket], Optional[bool]]]
 
 
 class SSHChannel(Generic[AnyStr], SSHPacketHandler):
@@ -111,7 +116,9 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._send_high_water: int
         self._send_low_water: int
 
-        self._env: Dict[str, str] = {}
+        self._env: Dict[bytes, bytes] = {}
+        self._str_env: Optional[Dict[str, str]] = None
+
         self._command: Optional[str] = None
         self._subsystem: Optional[str] = None
 
@@ -139,8 +146,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         self._recv_chan: Optional[int] = conn.add_channel(self)
 
-        self._logger = conn.logger.get_child(context='chan=%d' %
-                                             self._recv_chan)
+        self._logger = conn.logger.get_child(context=f'chan={self._recv_chan}')
 
         self.set_encoding(encoding, errors)
         self.set_write_buffer_limits()
@@ -198,7 +204,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         return self._write_datatypes
 
-    def _cleanup(self, exc: Exception = None) -> None:
+    def _cleanup(self, exc: Optional[Exception] = None) -> None:
         """Clean up this channel"""
 
         if self._open_waiter:
@@ -220,7 +226,13 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             self._request_waiters = []
 
         if self._session is not None:
-            self._session.connection_lost(exc)
+            # pylint: disable=broad-except
+            try:
+                self._session.connection_lost(exc)
+            except Exception:
+                self.logger.debug1('Uncaught exception in session ignored',
+                                   exc_info=sys.exc_info)
+
             self._session = None
 
         self._close_event.set()
@@ -322,7 +334,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             elif self._send_state == 'close_pending':
                 self._close_send()
 
-    def _flush_recv_buf(self, exc: Exception = None) -> None:
+    def _flush_recv_buf(self, exc: Optional[Exception] = None) -> None:
         """Flush as much data in the recv buffer as the application allows"""
 
         while self._recv_buf and not self._recv_paused:
@@ -394,19 +406,6 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         if self._send_state in {'close_pending', 'closed'}:
             return
 
-        datalen = len(data)
-
-        if datalen > self._recv_window:
-            raise ProtocolError('Window exceeded')
-
-        if datatype:
-            typename = ' from %s' % _data_type_names[datatype]
-        else:
-            typename = ''
-
-        self.logger.debug2('Received %d data byte%s%s', datalen,
-                           's' if datalen > 1 else '', typename)
-
         if self._recv_paused:
             self._recv_buf.append((data, datatype))
         else:
@@ -453,6 +452,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         self.logger.info('Closing channel due to connection close')
 
+        self._send_state = 'closed'
+        self._close_send()
         self._cleanup(exc)
 
     def process_open(self, send_chan: int, send_window: int, send_pktsize: int,
@@ -577,6 +578,14 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         data = packet.get_string()
         packet.check_end()
 
+        datalen = len(data)
+
+        if datalen > self._recv_window:
+            raise ProtocolError('Window exceeded')
+
+        self.logger.debug2('Received %d data byte%s', datalen,
+                           's' if datalen > 1 else '')
+
         self._accept_data(data)
 
     def _process_extended_data(self, _pkttype: int, _pktid: int,
@@ -592,6 +601,15 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         if datatype not in self._read_datatypes:
             raise ProtocolError('Invalid extended data type')
+
+        datalen = len(data)
+
+        if datalen > self._recv_window:
+            raise ProtocolError('Window exceeded')
+
+        self.logger.debug2('Received %d data byte%s from %s', datalen,
+                           's' if datalen > 1 else '',
+                           _data_type_names[datatype])
 
         self._accept_data(data, datatype)
 
@@ -845,8 +863,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         return self._send_buf_len
 
-    def set_write_buffer_limits(self, high: int = None,
-                                low: int = None) -> None:
+    def set_write_buffer_limits(self, high: Optional[int] = None,
+                                low: Optional[int] = None) -> None:
         """Set the high- and low-water limits for write flow control
 
            This method sets the limits used when deciding when to call
@@ -865,8 +883,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             low = high // 4
 
         if not 0 <= low <= high:
-            raise ValueError('high (%r) must be >= low (%r) must be >= 0' %
-                             (high, low))
+            raise ValueError(f'high (high) must be >= low ({low}) '
+                             'must be >= 0')
 
         self.logger.debug1('Set write buffer limits: low-water=%d, '
                            'high-water=%d', low, high)
@@ -920,7 +938,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         datalen = len(encoded_data)
 
         if datatype:
-            typename = ' to %s' % _data_type_names[datatype]
+            typename = f' to {_data_type_names[datatype]}'
         else:
             typename = ''
 
@@ -1005,7 +1023,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
            This method can be called to resume delivery of incoming data
            which was suspended by a call to :meth:`pause_reading`. As soon
            as this method is called, any buffered data will be delivered
-           immediately. A pending end-of-file notication may also be
+           immediately. A pending end-of-file notification may also be
            delivered if one was queued while reading was paused.
 
         """
@@ -1020,12 +1038,41 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         """Return the environment for this session
 
            This method returns the environment set by the client when
-           the session was opened. On the server, calls to this method
-           should only be made after :meth:`session_started
-           <SSHServerSession.session_started>` has been called on the
-           :class:`SSHServerSession`. When using the stream-based API,
-           calls to this can be made at any time after the handler
-           function has started up.
+           the session was opened. Keys and values are of type `str`
+           and this object only provides access to keys and values sent
+           as valid UTF-8 strings. Use :meth:`get_environment_bytes`
+           if you need to access environment variables with keys or
+           values containing binary data or non-UTF-8 encodings.
+
+           On the server, calls to this method should only be made after
+           :meth:`session_started <SSHServerSession.session_started>` has
+           been called on the :class:`SSHServerSession`. When using the
+           stream-based API, calls to this can be made at any time after
+           the handler function has started up.
+
+           :returns: A dictionary containing the environment variables
+                     set by the client
+
+        """
+
+        if self._str_env is None:
+            self._str_env = dict(decode_env(self._env))
+
+        return MappingProxyType(self._str_env)
+
+    def get_environment_bytes(self) -> Mapping[bytes, bytes]:
+        """Return the environment for this session
+
+           This method returns the environment set by the client when
+           the session was opened. Keys and values are of type `bytes`
+           and can include arbitrary binary data, with the exception
+           of NUL (\0) bytes.
+
+           On the server, calls to this method should only be made after
+           :meth:`session_started <SSHServerSession.session_started>` has
+           been called on the :class:`SSHServerSession`. When using the
+           stream-based API, calls to this can be made at any time after
+           the handler function has started up.
 
            :returns: A dictionary containing the environment variables
                      set by the client
@@ -1040,7 +1087,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
            This method returns the command the client requested to
            execute when the session was opened, if any. If the client
            did not request that a command be executed, this method
-           will return `None`. On the server, alls to this method
+           will return `None`. On the server, calls to this method
            should only be made after :meth:`session_started
            <SSHServerSession.session_started>` has been called on the
            :class:`SSHServerSession`. When using the stream-based API,
@@ -1087,7 +1134,7 @@ class SSHClientChannel(SSHChannel, Generic[AnyStr]):
 
     async def create(self, session_factory: SSHClientSessionFactory[AnyStr],
                      command: Optional[str], subsystem: Optional[str],
-                     env: Dict[str, str], request_pty: bool,
+                     env: Dict[bytes, bytes], request_pty: bool,
                      term_type: Optional[str], term_size: TermSizeArg,
                      term_modes: TermModes, x11_forwarding: Union[bool, str],
                      x11_display: Optional[str], x11_auth_path: Optional[str],
@@ -1109,10 +1156,16 @@ class SSHClientChannel(SSHChannel, Generic[AnyStr]):
         self._command = command
         self._subsystem = subsystem
 
-        for name, env_value in env.items():
-            self.logger.debug1('  Env: %s=%s', name, env_value)
-            self._send_request(b'env', String(str(name)),
-                               String(str(env_value)))
+        for key, value in env.items():
+            self.logger.debug1('  Env: %s=%s', key, value)
+
+            if not isinstance(key, (bytes, str)):
+                key = str(key)
+
+            if not isinstance(value, (bytes, str)):
+                value = str(value)
+
+            self._send_request(b'env', String(key), String(value))
 
         if request_pty:
             self.logger.debug1('  Terminal type: %s', term_type or 'None')
@@ -1134,7 +1187,7 @@ class SSHClientChannel(SSHChannel, Generic[AnyStr]):
             modes = b''
             for mode, mode_value in term_modes.items():
                 if mode <= PTY_OP_END or mode >= PTY_OP_RESERVED:
-                    raise ValueError('Invalid pty mode: %s' % mode)
+                    raise ValueError(f'Invalid pty mode: {mode}')
 
                 name = _pty_mode_names.get(mode, str(mode))
                 self.logger.debug2('  Mode %s: %d', name, mode_value)
@@ -1392,7 +1445,7 @@ class SSHClientChannel(SSHChannel, Generic[AnyStr]):
             try:
                 signal = _signal_names[signal]
             except KeyError:
-                raise ValueError('Unknown signal: %s' % int(signal)) from None
+                raise ValueError(f'Unknown signal: {signal}') from None
 
         self.logger.info('Sending %s signal', signal)
 
@@ -1450,8 +1503,8 @@ class SSHServerChannel(SSHChannel, Generic[AnyStr]):
 
         super().__init__(conn, loop, encoding, errors, window, max_pktsize)
 
-        self._env = cast(Dict[str, str],
-                         conn.get_key_option('environment', {}))
+        env_opt = cast(EnvMap, conn.get_key_option('environment', {}))
+        self._env = dict(encode_env(env_opt))
 
         self._allow_pty = allow_pty
         self._line_editor = line_editor
@@ -1606,23 +1659,16 @@ class SSHServerChannel(SSHChannel, Generic[AnyStr]):
     def _process_env_request(self, packet: SSHPacket) -> bool:
         """Process a request to set an environment variable"""
 
-        name_bytes = packet.get_string()
-        value_bytes = packet.get_string()
+        key = packet.get_string()
+        value = packet.get_string()
         packet.check_end()
 
-        try:
-            name = name_bytes.decode('utf-8')
-            value = value_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            self.logger.debug1('Invalid environment data')
-            return False
-
-        self.logger.debug1('  Env: %s=%s', name, value)
-        self._env[name] = value
+        self.logger.debug1('  Env: %s=%s', key, value)
+        self._env[key] = value
         return True
 
-    def _start_session(self, command: str = None,
-                       subsystem: str = None) -> bool:
+    def _start_session(self, command: Optional[str] = None,
+                       subsystem: Optional[str] = None) -> bool:
         """Tell the session what type of channel is being requested"""
 
         forced_command = \
@@ -1696,7 +1742,7 @@ class SSHServerChannel(SSHChannel, Generic[AnyStr]):
             self.logger.info('Received window change: %sx%s (%sx%s pixels)',
                              width, height, pixwidth, pixheight)
         else:
-            self.logger.info('Recceived window change: %sx%s', width, height)
+            self.logger.info('Received window change: %sx%s', width, height)
 
         self._term_size = (width, height, pixwidth, pixheight)
         self._session.terminal_size_changed(width, height, pixwidth, pixheight)
@@ -1827,7 +1873,7 @@ class SSHServerChannel(SSHChannel, Generic[AnyStr]):
            forwarding, this method returns `None`.
 
            :returns: A `str` containing the X11 display or `None` if
-                     X11 fowarding was not requested
+                     X11 forwarding was not requested
 
         """
 
@@ -1843,7 +1889,7 @@ class SSHServerChannel(SSHChannel, Generic[AnyStr]):
            `None`.
 
            :returns: A `str` containing the ssh-agent socket path or
-                     `None` if agent fowarding was not requested
+                     `None` if agent forwarding was not requested
 
         """
 
@@ -2019,16 +2065,16 @@ class SSHTCPChannel(SSHForwardChannel, Generic[AnyStr]):
             SSHTCPSession[AnyStr]:
         """Create a new outbound TCP session"""
 
-        return (await self._open_tcp(session_factory, b'direct-tcpip',
-                                     host, port, orig_host, orig_port))
+        return await self._open_tcp(session_factory, b'direct-tcpip',
+                                    host, port, orig_host, orig_port)
 
     async def accept(self, session_factory: SSHTCPSessionFactory[AnyStr],
                      host: str, port: int, orig_host: str,
                      orig_port: int) -> SSHTCPSession[AnyStr]:
         """Create a new forwarded TCP session"""
 
-        return (await self._open_tcp(session_factory, b'forwarded-tcpip',
-                                     host, port, orig_host, orig_port))
+        return await self._open_tcp(session_factory, b'forwarded-tcpip',
+                                    host, port, orig_host, orig_port)
 
     def set_inbound_peer_names(self, dest_host: str, dest_port: int,
                                orig_host: str, orig_port: int) -> None:
@@ -2076,6 +2122,54 @@ class SSHUNIXChannel(SSHForwardChannel, Generic[AnyStr]):
         """Set local and remote peer names for inbound connections"""
 
         self.set_extra_info(local_peername=dest_path, remote_peername='')
+
+
+class SSHTunTapChannel(SSHForwardChannel[bytes]):
+    """SSH TunTap channel"""
+
+    def __init__(self, conn: 'SSHConnection',
+                 loop: asyncio.AbstractEventLoop, encoding: Optional[str],
+                 errors: str, window: int, max_pktsize: int):
+        super().__init__(conn, loop, encoding, errors, window, max_pktsize)
+
+        self._mode: Optional[int] = None
+
+    def _accept_data(self, data: bytes, datatype: DataType = None) -> None:
+        """Strip off address family on incoming packets in TUN mode"""
+
+        if self._mode == SSH_TUN_MODE_POINTTOPOINT:
+            data = data[4:]
+
+        super()._accept_data(data, datatype)
+
+    def write(self, data: bytes, datatype: DataType = None) -> None:
+        """Add address family in outbound packets in TUN mode"""
+
+        if self._mode == SSH_TUN_MODE_POINTTOPOINT:
+            version = data[0] >> 4
+            family = SSH_TUN_AF_INET if version == 4 else SSH_TUN_AF_INET6
+            data = UInt32(family) + data
+
+        super().write(data, datatype)
+
+    async def open(self, session_factory: SSHTunTapSessionFactory,
+                   mode: int, unit: Optional[int]) -> SSHTunTapSession:
+        """Open a TUN/TAP channel"""
+
+        self._mode = mode
+
+        if unit is None:
+            unit = SSH_TUN_UNIT_ANY
+
+        return cast(SSHTunTapSession,
+                    await self._open_forward(session_factory,
+                                             b'tun@openssh.com',
+                                             UInt32(mode), UInt32(unit)))
+
+    def set_mode(self, mode: int) -> None:
+        """Set mode for inbound connections"""
+
+        self._mode = mode
 
 
 class SSHX11Channel(SSHForwardChannel[bytes]):
